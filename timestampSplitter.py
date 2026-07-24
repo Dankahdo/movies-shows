@@ -11,7 +11,6 @@ timestamp token and ignores the rest, for example:
   S1 E3 "Gripes of Wrath" 46:01
   S1 E4 "Psyche" 1:08:45
 """
-
 from __future__ import annotations
 
 import argparse
@@ -179,7 +178,7 @@ def run_ffmpeg_split(
 
 def build_output_name(mark: SegmentMark, extension: str) -> str:
 	label = sanitize_filename(mark.label)
-	return f"{mark.index:02d} - {label}{extension}"
+	return f"{label}{extension}"
 
 
 def split_media(

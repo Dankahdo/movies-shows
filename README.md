@@ -112,3 +112,40 @@ This produces variety across shows while preserving each show's episode order.
 BroadcastTV currently provides a practical, lightweight personal "TV channel" generator for local files.
 
 Its present scope is intentionally focused: stable folder scanning, repeat-safe progress tracking, and consistent playlist output. This makes it easy to run regularly while leaving room for future features such as richer metadata, channel presets, and time-aware scheduling.
+
+## Desktop Application
+
+A desktop app is now included at `media_center_app.py`.
+
+It provides:
+
+- Native Windows media playback through Qt Multimedia backend.
+- Arrow key skipping (left/right) with a configurable default of 5 seconds.
+- Autoplay queue behavior with optional loop.
+- Tabs for Home, Library, Broadcast, Tools, and Settings.
+- Home tab showing recently viewed files.
+- Library tab with search, movies/shows filter, and in-app playback.
+- Per-item user review notes and a 0-5 rating.
+- Broadcast tab that reuses `broadcast.py` logic and supports include/exclude lists for shows and movies.
+- Tools tab for YouTube ripping (`RipYoutube.py` behavior) and timestamp splitting (`timestampSplitter.py` behavior).
+
+### Run the App
+
+From the project root:
+
+  .\venv\Scripts\python.exe -m pip install -r requirements.txt
+  .\venv\Scripts\python.exe media_center_app.py
+
+Or use:
+
+  .\run_media_center.ps1
+
+### Build Executable (Windows)
+
+Use:
+
+  .\build_exe.ps1
+
+This builds a windowed executable with PyInstaller at:
+
+- `dist\LocalMediaCenter\LocalMediaCenter.exe`

@@ -1,0 +1,17 @@
+Make an executable application that will video play my local media library.
+
+if possible make use of the already available media player in windows consider other options if more effective.
+
+features that should be included are auto play 5 second arrow key skips forward and backward etc etc 
+
+this app should have intuitive tabs to natively navigate the library and certain settings and functionality, 
+a home tab with recently viewed, a search bar to look through the library, a filter between movies and shows.
+
+using the already made broadcasting logic adapt that script into the application to generate a looping broadcast of my library.
+there should be an additional setting that allows to choose what series/movie is and is not included in the broadcast list.
+
+for additional fun also add functionality to include reviews/notes from me the user and a standard rating system out of 5
+
+for the sake of convience also include a tab for the ripYoutube script and timestamp splitter script functionality to make use of these functionalities in the application 
+
+when making the application consider efficiency and redundancy in the making of the code

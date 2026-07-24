@@ -3,3 +3,27 @@ movies/
 show series/
 broadcast_state.json
 broadcast_playlist.m3u
+
+# App runtime state
+app_state.json
+
+# Download/split outputs
+downloads/
+split_output/
+
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec
+
+# OS/editor noise
+desktop.ini
+.DS_Store
+Thumbs.db
