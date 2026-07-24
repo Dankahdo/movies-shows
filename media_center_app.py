@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import traceback
 from dataclasses import dataclass
@@ -11,7 +14,7 @@ from typing import Callable
 
 import yt_dlp
 from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -36,10 +39,12 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStyle,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +63,30 @@ from timestampSplitter import split_media
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".flv", ".webm"}
 APP_STATE_FILE = BASE_DIR / "app_state.json"
+THUMBNAILS_DIR = BASE_DIR / ".thumbnails"
+COLLECTION_TAG_PATTERN = re.compile(r"^\(\s*(completed|complete|ip)\s*\)\s*", re.IGNORECASE)
+
+
+def parse_collection_tag(folder_name: str) -> tuple[str, str]:
+    match = COLLECTION_TAG_PATTERN.match(folder_name)
+    if not match:
+        return "Unspecified", folder_name
+
+    tag = match.group(1).lower()
+    clean_name = folder_name[match.end() :].strip() or folder_name
+    if tag in {"completed", "complete"}:
+        return "Completed", clean_name
+    if tag == "ip":
+        return "In Progress", clean_name
+    return "Unspecified", clean_name
+
+
+def status_badge_text(status: str) -> str:
+    if status == "Completed":
+        return "Completed"
+    if status == "In Progress":
+        return "IP"
+    return "Unspecified"
 
 
 @dataclass
@@ -66,6 +95,7 @@ class MediaItem:
     kind: str
     title: str
     group: str
+    collection_status: str = "Unspecified"
 
 
 class AppState:
@@ -86,7 +116,9 @@ class AppState:
                 "output_path": str(DEFAULT_OUTPUT),
                 "last_index": 0,
                 "last_position_ms": 0,
+                "completed_only_default": True,
             },
+            "custom_thumbnails": {},
         }
         self.load()
 
@@ -112,6 +144,9 @@ class MediaCenterWindow(QMainWindow):
 
         self.state = AppState(APP_STATE_FILE)
         self.media_items: list[MediaItem] = []
+        self.media_lookup: dict[str, MediaItem] = {}
+        self.group_first_media: dict[str, Path] = {}
+        self.thumbnail_attempted_keys: set[str] = set()
         self.current_queue: list[Path] = []
         self.current_index = -1
         self.loop_queue = True
@@ -135,6 +170,7 @@ class MediaCenterWindow(QMainWindow):
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
 
         self._install_shortcuts()
 
@@ -159,10 +195,10 @@ class MediaCenterWindow(QMainWindow):
         control_bar_layout.setSpacing(6)
 
         controls = QHBoxLayout()
-        self.play_button = QPushButton("Play")
-        self.pause_button = QPushButton("Pause")
+        self.play_pause_button = QPushButton("Play")
         self.next_button = QPushButton("Next")
         self.prev_button = QPushButton("Previous")
+        self.tabs_toggle_button = QPushButton("Hide Tabs")
         self.fullscreen_button = QPushButton("Fullscreen")
         self.position_label = QLabel("00:00 / 00:00")
         self.progress = QSlider(Qt.Orientation.Horizontal)
@@ -171,10 +207,11 @@ class MediaCenterWindow(QMainWindow):
         self.progress.setPageStep(50)
         self.progress.setToolTip("Drag to seek")
 
-        controls.addWidget(self.play_button)
-        controls.addWidget(self.pause_button)
+        self.tabs_toggle_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        controls.addWidget(self.play_pause_button)
         controls.addWidget(self.prev_button)
         controls.addWidget(self.next_button)
+        controls.addWidget(self.tabs_toggle_button)
         controls.addWidget(self.fullscreen_button)
         controls.addWidget(self.position_label)
 
@@ -191,10 +228,10 @@ class MediaCenterWindow(QMainWindow):
         self.controls_fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.controls_fade_animation.finished.connect(self._on_controls_fade_finished)
 
-        self.play_button.clicked.connect(lambda: self.player.play())
-        self.pause_button.clicked.connect(lambda: self.player.pause())
+        self.play_pause_button.clicked.connect(self.toggle_play_pause)
         self.next_button.clicked.connect(self.play_next)
         self.prev_button.clicked.connect(self.play_previous)
+        self.tabs_toggle_button.clicked.connect(self.toggle_tabs_panel)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         self.progress.sliderPressed.connect(self._on_seek_start)
         self.progress.sliderReleased.connect(self._on_seek_end)
@@ -268,12 +305,16 @@ class MediaCenterWindow(QMainWindow):
         self.search_box.setPlaceholderText("Search title, series, or filename")
         self.filter_box = QComboBox()
         self.filter_box.addItems(["All", "Movies", "Shows"])
+        self.collection_filter_box = QComboBox()
+        self.collection_filter_box.addItems(["All Status", "Completed", "In Progress", "Unspecified"])
         refresh_btn = QPushButton("Refresh")
 
         toolbar.addWidget(QLabel("Search:"))
         toolbar.addWidget(self.search_box, stretch=1)
         toolbar.addWidget(QLabel("Filter:"))
         toolbar.addWidget(self.filter_box)
+        toolbar.addWidget(QLabel("Collection:"))
+        toolbar.addWidget(self.collection_filter_box)
         toolbar.addWidget(refresh_btn)
 
         splitter = QSplitter()
@@ -294,6 +335,7 @@ class MediaCenterWindow(QMainWindow):
 
         save_review = QPushButton("Save Review")
         play_now = QPushButton("Play Selected")
+        set_thumbnail = QPushButton("Set Custom Image")
 
         review_form = QFormLayout()
         review_form.addRow("Title", self.selected_title)
@@ -302,6 +344,7 @@ class MediaCenterWindow(QMainWindow):
 
         right_layout.addLayout(review_form)
         right_layout.addWidget(save_review)
+        right_layout.addWidget(set_thumbnail)
         right_layout.addWidget(play_now)
         right_layout.addStretch(1)
 
@@ -315,8 +358,10 @@ class MediaCenterWindow(QMainWindow):
 
         self.search_box.textChanged.connect(self.populate_library_tree)
         self.filter_box.currentIndexChanged.connect(self.populate_library_tree)
+        self.collection_filter_box.currentIndexChanged.connect(self.populate_library_tree)
         refresh_btn.clicked.connect(self.refresh_library)
         save_review.clicked.connect(self.save_current_review)
+        set_thumbnail.clicked.connect(self.set_custom_thumbnail_for_selected)
         play_now.clicked.connect(self._play_selected_library_item)
 
         return tab
@@ -331,11 +376,14 @@ class MediaCenterWindow(QMainWindow):
         self.bc_include_movies = QCheckBox("Interleave movies")
         self.bc_include_movies.setChecked(True)
 
+        broadcast_state = self.state.data.get("broadcast", {})
+        self.bc_completed_only_default = QCheckBox("Include only Completed by default")
+        self.bc_completed_only_default.setChecked(bool(broadcast_state.get("completed_only_default", True)))
+
         self.bc_movie_every = QSpinBox()
         self.bc_movie_every.setRange(1, 100)
         self.bc_movie_every.setValue(8)
 
-        broadcast_state = self.state.data.get("broadcast", {})
         self.bc_output = QLineEdit(str(broadcast_state.get("output_path", str(DEFAULT_OUTPUT))))
         output_btn = QPushButton("Browse")
 
@@ -343,6 +391,7 @@ class MediaCenterWindow(QMainWindow):
             QLabel("Broadcast always includes every episode from included shows."), 0, 0, 1, 3
         )
         settings_layout.addWidget(self.bc_include_movies, 1, 0, 1, 2)
+        settings_layout.addWidget(self.bc_completed_only_default, 1, 2)
 
         settings_layout.addWidget(QLabel("Movie every N episodes"), 2, 0)
         settings_layout.addWidget(self.bc_movie_every, 2, 1)
@@ -373,6 +422,7 @@ class MediaCenterWindow(QMainWindow):
         output_btn.clicked.connect(self._browse_broadcast_output)
         self.bc_generate_btn.clicked.connect(self.generate_broadcast)
         self.bc_play_btn.clicked.connect(self.play_generated_playlist)
+        self.bc_completed_only_default.stateChanged.connect(self._on_broadcast_default_filter_changed)
 
         queue_box = QGroupBox("Broadcast Queue")
         queue_layout = QVBoxLayout(queue_box)
@@ -537,6 +587,165 @@ class MediaCenterWindow(QMainWindow):
         if file_name:
             self.bc_output.setText(file_name)
 
+    def _on_broadcast_default_filter_changed(self) -> None:
+        broadcast_state = self.state.data.setdefault("broadcast", {})
+        broadcast_state["completed_only_default"] = self.bc_completed_only_default.isChecked()
+        self.state.save()
+        self.refresh_broadcast_lists()
+
+    def toggle_play_pause(self) -> None:
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.play_pause_button.setText("Pause")
+        else:
+            self.play_pause_button.setText("Play")
+
+    def toggle_tabs_panel(self) -> None:
+        tabs_visible = self.tabs.isVisible()
+        self.tabs.setVisible(not tabs_visible)
+        if tabs_visible:
+            self.tabs_toggle_button.setText("Show Tabs")
+            self.tabs_toggle_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        else:
+            self.tabs_toggle_button.setText("Hide Tabs")
+            self.tabs_toggle_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+
+    def _thumbnail_key(self, media: MediaItem) -> str:
+        return f"{media.kind}:{media.group}"
+
+    def _safe_thumbnail_name(self, key: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
+
+    def _ensure_auto_thumbnail_for_key(self, key: str, source_video: Path) -> Path | None:
+        if key in self.thumbnail_attempted_keys:
+            candidate = THUMBNAILS_DIR / f"{self._safe_thumbnail_name(key)}.jpg"
+            return candidate if candidate.exists() else None
+
+        self.thumbnail_attempted_keys.add(key)
+        if shutil.which("ffmpeg") is None:
+            return None
+
+        THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+        output_path = THUMBNAILS_DIR / f"{self._safe_thumbnail_name(key)}.jpg"
+        if output_path.exists():
+            return output_path
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    "00:00:05",
+                    "-i",
+                    str(source_video),
+                    "-frames:v",
+                    "1",
+                    str(output_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if output_path.exists():
+                return output_path
+        except Exception:
+            return None
+        return None
+
+    def _icon_for_media_item(self, media: MediaItem) -> QIcon:
+        key = self._thumbnail_key(media)
+        custom = self.state.data.get("custom_thumbnails", {}).get(key)
+        if custom and Path(custom).exists():
+            return QIcon(custom)
+
+        source_video = self.group_first_media.get(key)
+        if source_video and source_video.exists():
+            auto_thumb = self._ensure_auto_thumbnail_for_key(key, source_video)
+            if auto_thumb and auto_thumb.exists():
+                return QIcon(str(auto_thumb))
+
+        return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+    def _media_item_for_path(self, path: Path) -> MediaItem | None:
+        existing = self.media_lookup.get(str(path))
+        if existing:
+            return existing
+
+        settings = self.state.data.get("settings", {})
+        shows_dir = Path(settings.get("shows_dir", str(SHOWS_DIR)))
+        movies_dir = Path(settings.get("movies_dir", str(MOVIES_DIR)))
+
+        try:
+            rel_show = path.relative_to(shows_dir)
+            if len(rel_show.parts) >= 2:
+                status, _ = parse_collection_tag(rel_show.parts[0])
+                return MediaItem(
+                    path=path,
+                    kind="Show",
+                    title=path.stem,
+                    group=rel_show.parts[0],
+                    collection_status=status,
+                )
+        except Exception:
+            pass
+
+        try:
+            rel_movie = path.relative_to(movies_dir)
+            group = rel_movie.parts[0] if len(rel_movie.parts) > 1 else movies_dir.name
+            status, _ = parse_collection_tag(group)
+            return MediaItem(
+                path=path,
+                kind="Movie",
+                title=path.stem,
+                group=group,
+                collection_status=status,
+            )
+        except Exception:
+            pass
+
+        return None
+
+    def set_custom_thumbnail_for_selected(self) -> None:
+        items = self.library_tree.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Custom Image", "Select a library item first.")
+            return
+
+        path_str = items[0].data(0, Qt.UserRole)
+        if not path_str:
+            QMessageBox.information(self, "Custom Image", "Select a library item first.")
+            return
+
+        media = self._find_media_by_path(path_str)
+        if not media:
+            QMessageBox.information(self, "Custom Image", "Selected media not found.")
+            return
+
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Thumbnail Image",
+            str(BASE_DIR),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if not image_path:
+            return
+
+        key = self._thumbnail_key(media)
+        self.state.data.setdefault("custom_thumbnails", {})[key] = image_path
+        self.state.save()
+        self.populate_library_tree()
+        self.refresh_recent_view()
+        self._set_broadcast_queue_view(self.broadcast_queue)
+
     def _threaded(self, fn: Callable[[], None], done: Callable[[str, bool], None]) -> None:
         def runner() -> None:
             try:
@@ -562,25 +771,49 @@ class MediaCenterWindow(QMainWindow):
         movies_dir = Path(self.state.data.get("settings", {}).get("movies_dir", str(MOVIES_DIR)))
 
         self.media_items = []
+        self.media_lookup = {}
+        self.group_first_media = {}
 
         if movies_dir.exists():
             for root, _, files in os.walk(movies_dir):
+                group_name = Path(root).name
+                collection_status, _ = parse_collection_tag(group_name)
                 for name in files:
                     path = Path(root) / name
                     if path.suffix.lower() in VIDEO_EXTENSIONS:
                         self.media_items.append(
-                            MediaItem(path=path, kind="Movie", title=path.stem, group=Path(root).name)
+                            MediaItem(
+                                path=path,
+                                kind="Movie",
+                                title=path.stem,
+                                group=group_name,
+                                collection_status=collection_status,
+                            )
                         )
 
         if shows_dir.exists():
             for show_folder in sorted([p for p in shows_dir.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+                collection_status, _ = parse_collection_tag(show_folder.name)
                 for root, _, files in os.walk(show_folder):
                     for name in files:
                         path = Path(root) / name
                         if path.suffix.lower() in VIDEO_EXTENSIONS:
                             self.media_items.append(
-                                MediaItem(path=path, kind="Show", title=path.stem, group=show_folder.name)
+                                MediaItem(
+                                    path=path,
+                                    kind="Show",
+                                    title=path.stem,
+                                    group=show_folder.name,
+                                    collection_status=collection_status,
+                                )
                             )
+
+        self.media_items.sort(key=lambda m: str(m.path).lower())
+        for media in self.media_items:
+            self.media_lookup[str(media.path)] = media
+            key = self._thumbnail_key(media)
+            if key not in self.group_first_media:
+                self.group_first_media[key] = media.path
 
         self.populate_library_tree()
         self.refresh_broadcast_lists()
@@ -588,6 +821,7 @@ class MediaCenterWindow(QMainWindow):
     def populate_library_tree(self) -> None:
         query = self.search_box.text().strip().lower()
         filter_value = self.filter_box.currentText()
+        status_filter = self.collection_filter_box.currentText()
 
         self.library_tree.clear()
 
@@ -598,6 +832,9 @@ class MediaCenterWindow(QMainWindow):
             if filter_value == "Shows" and item.kind != "Show":
                 continue
 
+            if status_filter != "All Status" and item.collection_status != status_filter:
+                continue
+
             searchable = f"{item.title} {item.group} {item.path.name}".lower()
             if query and query not in searchable:
                 continue
@@ -605,19 +842,45 @@ class MediaCenterWindow(QMainWindow):
             grouped.setdefault(item.group, []).append(item)
 
         for group_name in sorted(grouped):
-            parent = QTreeWidgetItem([group_name, "", ""])
+            status, clean_group_name = parse_collection_tag(group_name)
+            parent_label = f"{clean_group_name} [{status_badge_text(status)}]"
+            parent = QTreeWidgetItem([parent_label, "", ""])
+            group_icon_set = False
             self.library_tree.addTopLevelItem(parent)
             for media in sorted(grouped[group_name], key=lambda m: m.title.lower()):
                 child = QTreeWidgetItem([media.title, media.kind, str(media.path)])
+                icon = self._icon_for_media_item(media)
+                child.setIcon(0, icon)
                 child.setData(0, Qt.UserRole, str(media.path))
                 parent.addChild(child)
-            parent.setExpanded(True)
+                if not group_icon_set:
+                    parent.setIcon(0, icon)
+                    group_icon_set = True
+            parent.setExpanded(False)
+
+        self._focus_current_library_item()
 
     def _find_media_by_path(self, path_str: str) -> MediaItem | None:
         for item in self.media_items:
             if str(item.path) == path_str:
                 return item
         return None
+
+    def _natural_text_key(self, text: str) -> list:
+        parts = re.split(r"(\d+)", text)
+        return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+    def _series_queue_for_media(self, media: MediaItem) -> tuple[list[Path], int]:
+        if media.kind != "Show":
+            return [media.path], 0
+
+        series_items = [m for m in self.media_items if m.kind == "Show" and m.group == media.group]
+        series_items.sort(key=lambda m: self._natural_text_key(str(m.path)))
+
+        queue = [m.path for m in series_items]
+        selected_path = str(media.path)
+        start_index = next((i for i, p in enumerate(queue) if str(p) == selected_path), 0)
+        return queue, start_index
 
     def _on_library_selection(self) -> None:
         items = self.library_tree.selectedItems()
@@ -663,8 +926,12 @@ class MediaCenterWindow(QMainWindow):
         if not path_str:
             return
 
-        queue = [Path(path_str)]
-        self.play_paths(queue, start_index=0, loop=False)
+        media = self._find_media_by_path(path_str)
+        if not media:
+            return
+
+        queue, start_index = self._series_queue_for_media(media)
+        self.play_paths(queue, start_index=start_index, loop=False)
 
     def _play_recent_item(self, item: QListWidgetItem) -> None:
         path_str = item.data(Qt.UserRole)
@@ -709,6 +976,7 @@ class MediaCenterWindow(QMainWindow):
         if add_recent:
             self._add_recent(current_path)
         self._update_broadcast_queue_highlight()
+        self._focus_current_library_item()
 
     def play_next(self) -> None:
         if not self.current_queue:
@@ -737,6 +1005,9 @@ class MediaCenterWindow(QMainWindow):
         for idx, path in enumerate(paths, start=1):
             label = f"{idx:04d}  |  {path.name}"
             item = QListWidgetItem(label)
+            media = self._media_item_for_path(path)
+            if media:
+                item.setIcon(self._icon_for_media_item(media))
             item.setData(Qt.UserRole, str(path))
             self.bc_queue_list.addItem(item)
         self._update_broadcast_queue_highlight()
@@ -752,6 +1023,23 @@ class MediaCenterWindow(QMainWindow):
 
         self.bc_queue_list.setCurrentRow(self.current_index)
         self.bc_queue_list.scrollToItem(self.bc_queue_list.item(self.current_index))
+
+    def _focus_current_library_item(self) -> None:
+        if not self.current_queue or self.current_index < 0 or self.current_index >= len(self.current_queue):
+            return
+
+        target_path = str(self.current_queue[self.current_index])
+        iterator = QTreeWidgetItemIterator(self.library_tree)
+        while iterator.value():
+            item = iterator.value()
+            if item.childCount() == 0 and item.data(0, Qt.UserRole) == target_path:
+                parent = item.parent()
+                if parent:
+                    parent.setExpanded(True)
+                self.library_tree.setCurrentItem(item)
+                self.library_tree.scrollToItem(item)
+                return
+            iterator += 1
 
     def play_selected_broadcast_item(self) -> None:
         if not self.broadcast_queue:
@@ -778,6 +1066,7 @@ class MediaCenterWindow(QMainWindow):
     def _persist_broadcast_resume_state(self) -> None:
         broadcast_state = self.state.data.setdefault("broadcast", {})
         broadcast_state["output_path"] = self.bc_output.text().strip() or str(DEFAULT_OUTPUT)
+        broadcast_state["completed_only_default"] = self.bc_completed_only_default.isChecked()
 
         if self.broadcast_queue:
             resolved_index = 0
@@ -966,6 +1255,9 @@ class MediaCenterWindow(QMainWindow):
             played = row.get("last_played", "")
             label = f"{Path(path).name}   |   {played}"
             item = QListWidgetItem(label)
+            media = self._media_item_for_path(Path(path))
+            if media:
+                item.setIcon(self._icon_for_media_item(media))
             item.setData(Qt.UserRole, path)
             self.recent_list.addItem(item)
 
@@ -982,11 +1274,15 @@ class MediaCenterWindow(QMainWindow):
 
         excluded_shows = set(self.state.data.get("broadcast_excluded_shows", []))
         excluded_movies = set(self.state.data.get("broadcast_excluded_movies", []))
+        completed_only_default = self.bc_completed_only_default.isChecked()
 
         for show_name in sorted(shows):
-            item = QListWidgetItem(show_name)
+            status, clean_name = parse_collection_tag(show_name)
+            item = QListWidgetItem(f"{clean_name} [{status_badge_text(status)}]")
+            item.setData(Qt.UserRole, show_name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked if show_name in excluded_shows else Qt.Checked)
+            default_unchecked = completed_only_default and status != "Completed"
+            item.setCheckState(Qt.Unchecked if show_name in excluded_shows or default_unchecked else Qt.Checked)
             self.bc_show_list.addItem(item)
 
         for movie in movies:
@@ -1004,7 +1300,8 @@ class MediaCenterWindow(QMainWindow):
         for i in range(self.bc_show_list.count()):
             item = self.bc_show_list.item(i)
             if item.checkState() != Qt.Checked:
-                excluded_shows.add(item.text())
+                raw_show_name = item.data(Qt.UserRole) or item.text()
+                excluded_shows.add(raw_show_name)
 
         for i in range(self.bc_movie_list.count()):
             item = self.bc_movie_list.item(i)
