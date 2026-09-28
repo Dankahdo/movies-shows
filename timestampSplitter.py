@@ -24,6 +24,9 @@ from pathlib import Path
 
 
 TIMESTAMP_PATTERN = re.compile(r"\b(?:\d{1,2}:)?\d{1,2}:\d{2}\b")
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "output"
+DEFAULT_OUTPUT_DIR = OUTPUT_DIR / "split_output"
 
 
 @dataclass
@@ -240,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument(
 		"--output-dir",
-		default=Path("split_output"),
+		default=DEFAULT_OUTPUT_DIR,
 		type=Path,
 		help="Directory where split episode files are written",
 	)

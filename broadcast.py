@@ -33,10 +33,12 @@ from pathlib import Path
 # Paths (relative to this script's location)
 # ---------------------------------------------------------------------------
 BASE_DIR       = Path(__file__).parent
+DATA_DIR       = BASE_DIR / "data"
+OUTPUT_DIR     = BASE_DIR / "output"
 SHOWS_DIR      = BASE_DIR / "show series"
 MOVIES_DIR     = BASE_DIR / "movies"
-STATE_FILE     = BASE_DIR / "broadcast_state.json"
-DEFAULT_OUTPUT = BASE_DIR / "broadcast_playlist.m3u"
+STATE_FILE     = DATA_DIR / "broadcast_state.json"
+DEFAULT_OUTPUT = OUTPUT_DIR / "broadcast_playlist.m3u"
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".flv", ".webm"}
 
@@ -100,6 +102,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2, ensure_ascii=False)
 
@@ -195,6 +198,7 @@ def build_playlist(
 # M3U output
 # ---------------------------------------------------------------------------
 def write_m3u(playlist: list[Path], output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w", encoding="utf-8") as fh:
         fh.write("#EXTM3U\n")
         for path in playlist:

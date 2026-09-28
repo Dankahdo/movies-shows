@@ -9,7 +9,27 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
+
+
+def reorder_episode_pipe(stem: str) -> str:
+    """Convert 'Episode Name | Episode 12' into 'Episode 12 Episode Name'."""
+    if "|" not in stem and "｜" not in stem:
+        return stem
+
+    parts = [part.strip() for part in re.split(r"[|｜]", stem)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return stem
+
+    left, right = parts
+    right_has_episode = re.search(r"\bepisode\b", right, flags=re.IGNORECASE)
+    left_has_episode = re.search(r"\bepisode\b", left, flags=re.IGNORECASE)
+
+    if right_has_episode and not left_has_episode:
+        return f"{right} {left}"
+
+    return stem
 
 
 def scrub_prefix(root: Path, dry_run: bool) -> int:
@@ -24,10 +44,13 @@ def scrub_prefix(root: Path, dry_run: bool) -> int:
             continue
 
         old_name = path.name
-        if "AnimePahe_" not in old_name:
-            continue
-
         new_name = old_name.replace("AnimePahe_", "")
+
+        suffix = path.suffix
+        stem = new_name.removesuffix(suffix) if suffix else new_name
+        stem = reorder_episode_pipe(stem)
+        new_name = f"{stem}{suffix}"
+
         if not new_name or new_name == old_name:
             continue
 
@@ -47,7 +70,9 @@ def scrub_prefix(root: Path, dry_run: bool) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Scrub AnimePahe_ from file names under show series/.")
+    parser = argparse.ArgumentParser(
+        description="Clean up show file names (AnimePahe_ prefix + episode pipe reordering)."
+    )
     parser.add_argument(
         "--root",
         type=Path,

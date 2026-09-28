@@ -12,9 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-import yt_dlp
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QTimer, Qt, QUrl
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -23,6 +22,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
     QGroupBox,
@@ -35,11 +35,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
-    QProgressBar,
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QStyle,
+    QStyleOptionSlider,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
@@ -49,21 +50,35 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import nerv_theme as theme
+from nerv_theme import (
+    HazardStripe,
+    MonitorFrame,
+    NervHeader,
+    NoSignalScreen,
+    RatingBar,
+    ReadoutTile,
+    SectionHeader,
+    repolish,
+)
+
 from broadcast import (
     BASE_DIR,
+    DATA_DIR,
     DEFAULT_OUTPUT,
     MOVIES_DIR,
+    OUTPUT_DIR,
     SHOWS_DIR,
     scan_all_shows,
     scan_movies,
     write_m3u,
 )
-from RipYoutube import resolve_download_url
+from RipYoutube import download_with_fallback, resolve_download_url
 from timestampSplitter import split_media
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".flv", ".webm"}
-APP_STATE_FILE = BASE_DIR / "app_state.json"
-THUMBNAILS_DIR = BASE_DIR / ".thumbnails"
+APP_STATE_FILE = DATA_DIR / "app_state.json"
+THUMBNAILS_DIR = DATA_DIR / ".thumbnails"
 COLLECTION_TAG_PATTERN = re.compile(r"^\(\s*(completed|complete|ip)\s*\)\s*", re.IGNORECASE)
 
 
@@ -83,10 +98,39 @@ def parse_collection_tag(folder_name: str) -> tuple[str, str]:
 
 def status_badge_text(status: str) -> str:
     if status == "Completed":
-        return "Completed"
+        return "COMPLETE"
     if status == "In Progress":
-        return "IP"
-    return "Unspecified"
+        return "IN PROGRESS"
+    return "UNTAGGED"
+
+
+def friendly_timestamp(iso_text: str) -> str:
+    try:
+        stamp = datetime.fromisoformat(iso_text)
+    except ValueError:
+        return iso_text
+    days = (datetime.now().date() - stamp.date()).days
+    if days == 0:
+        return f"TODAY {stamp:%H:%M}"
+    if days == 1:
+        return f"YESTERDAY {stamp:%H:%M}"
+    return f"{stamp:%Y.%m.%d %H:%M}"
+
+
+def make_button(text: str, variant: str | None = None, tooltip: str = "") -> QPushButton:
+    button = QPushButton(text)
+    if variant:
+        button.setProperty("variant", variant)
+    if tooltip:
+        button.setToolTip(tooltip)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    return button
+
+
+def make_label(text: str, object_name: str) -> QLabel:
+    label = QLabel(text)
+    label.setObjectName(object_name)
+    return label
 
 
 @dataclass
@@ -133,14 +177,41 @@ class AppState:
             pass
 
     def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+class SeekSlider(QSlider):
+    """Clicking the track jumps the handle straight to that spot (and keeps dragging),
+    instead of QSlider's default page-step toward the click."""
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            option = QStyleOptionSlider()
+            self.initStyleOption(option)
+            style = self.style()
+            handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderHandle, self)
+            click = event.position().toPoint()
+            if not handle.contains(click):
+                groove = style.subControlRect(
+                    QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderGroove, self
+                )
+                span = max(1, groove.width() - handle.width())
+                offset = click.x() - groove.x() - handle.width() // 2
+                self.setSliderPosition(
+                    QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), offset, span)
+                )
+        # The handle now sits under the cursor, so the base class starts a normal drag:
+        # sliderPressed -> sliderMoved... -> sliderReleased, which performs the seek.
+        super().mousePressEvent(event)
 
 
 class MediaCenterWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Local Media Center")
-        self.resize(1450, 900)
+        self.setWindowTitle("MAGI // Local Media Center")
+        self.resize(1450, 940)
+        self.setMinimumSize(1100, 720)
 
         self.state = AppState(APP_STATE_FILE)
         self.media_items: list[MediaItem] = []
@@ -161,6 +232,7 @@ class MediaCenterWindow(QMainWindow):
         self.controls_target_visible = True
 
         self.audio_output = QAudioOutput()
+        self.audio_output.setVolume(int(self.state.data.get("settings", {}).get("volume", 80)) / 100)
         self.player = QMediaPlayer()
         self.player.setAudioOutput(self.audio_output)
 
@@ -179,45 +251,95 @@ class MediaCenterWindow(QMainWindow):
         self.refresh_broadcast_lists()
         self.refresh_recent_view()
         self.restore_broadcast_session()
+        self._update_now_playing()
 
     def _build_ui(self) -> None:
         root = QWidget()
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(8, 8, 8, 8)
+        self.root_layout = QVBoxLayout(root)
+        self.root_layout.setContentsMargins(0, 0, 0, 0)
+        self.root_layout.setSpacing(0)
 
-        player_box = QGroupBox("Player")
-        player_layout = QVBoxLayout(player_box)
-        player_layout.addWidget(self.video_widget, stretch=1)
+        self.header = NervHeader()
+        self.header_stripe = HazardStripe(6)
 
-        self.control_bar = QWidget()
-        control_bar_layout = QVBoxLayout(self.control_bar)
-        control_bar_layout.setContentsMargins(0, 0, 0, 0)
-        control_bar_layout.setSpacing(6)
+        body = QWidget()
+        self.body_layout = QVBoxLayout(body)
+        self.body_layout.setContentsMargins(10, 10, 10, 6)
 
-        controls = QHBoxLayout()
-        self.play_pause_button = QPushButton("Play")
-        self.next_button = QPushButton("Next")
-        self.prev_button = QPushButton("Previous")
-        self.tabs_toggle_button = QPushButton("Hide Tabs")
-        self.fullscreen_button = QPushButton("Fullscreen")
-        self.position_label = QLabel("00:00 / 00:00")
-        self.progress = QSlider(Qt.Orientation.Horizontal)
-        self.progress.setRange(0, 1000)
-        self.progress.setSingleStep(1)
-        self.progress.setPageStep(50)
-        self.progress.setToolTip("Drag to seek")
+        self.monitor_panel = self._build_monitor_panel()
 
-        self.tabs_toggle_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
-        controls.addWidget(self.play_pause_button)
-        controls.addWidget(self.prev_button)
-        controls.addWidget(self.next_button)
-        controls.addWidget(self.tabs_toggle_button)
-        controls.addWidget(self.fullscreen_button)
-        controls.addWidget(self.position_label)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(False)
+        self.home_tab = self._build_home_tab()
+        self.library_tab = self._build_library_tab()
+        self.broadcast_tab = self._build_broadcast_tab()
+        self.tools_tab = self._build_tools_tab()
+        self.settings_tab = self._build_settings_tab()
 
-        control_bar_layout.addLayout(controls)
-        control_bar_layout.addWidget(self.progress)
-        player_layout.addWidget(self.control_bar)
+        self.tabs.addTab(self.home_tab, "01  HOME")
+        self.tabs.addTab(self.library_tab, "02  LIBRARY")
+        self.tabs.addTab(self.broadcast_tab, "03  BROADCAST")
+        self.tabs.addTab(self.tools_tab, "04  TOOLS")
+        self.tabs.addTab(self.settings_tab, "05  SYSTEM")
+
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.addWidget(self.monitor_panel)
+        self.main_splitter.addWidget(self.tabs)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setSizes([520, 360])
+        self.body_layout.addWidget(self.main_splitter)
+
+        self.root_layout.addWidget(self.header)
+        self.root_layout.addWidget(self.header_stripe)
+        self.root_layout.addWidget(body, stretch=1)
+        self.setCentralWidget(root)
+
+        self.statusBar().setSizeGripEnabled(False)
+        hints = make_label("SPACE play/pause  ·  ←/→ skip  ·  F fullscreen  ·  ESC exit", "hint")
+        self.statusBar().addPermanentWidget(hints)
+        self._notify("MAGI SYSTEM ONLINE")
+
+        refresh_action = QAction("Refresh Library", self)
+        refresh_action.triggered.connect(self.refresh_library)
+        self.addAction(refresh_action)
+
+    def _build_monitor_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("monitorPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
+
+        self.monitor_header = QWidget()
+        self.monitor_header.setObjectName("monitorHeader")
+        mh = QHBoxLayout(self.monitor_header)
+        mh.setContentsMargins(0, 0, 0, 0)
+        mh.setSpacing(10)
+        self.mode_badge = make_label("STANDBY", "modeBadge")
+        self.mode_badge.setProperty("mode", "idle")
+        self.queue_pos_label = make_label("", "queuePos")
+        mh.addWidget(make_label("MAIN MONITOR", "monitorTitle"))
+        mh.addWidget(self.mode_badge)
+        mh.addStretch(1)
+        mh.addWidget(self.queue_pos_label)
+
+        self.monitor_frame = MonitorFrame()
+        frame_layout = QVBoxLayout(self.monitor_frame)
+        frame_layout.setContentsMargins(4, 4, 4, 4)
+        self.monitor_stack = QStackedWidget()
+        self.no_signal = NoSignalScreen()
+        self.video_widget.setStyleSheet("background-color: #000;")
+        self.monitor_stack.addWidget(self.no_signal)
+        self.monitor_stack.addWidget(self.video_widget)
+        frame_layout.addWidget(self.monitor_stack)
+
+        self.control_bar = self._build_control_bar()
+
+        layout.addWidget(self.monitor_header)
+        layout.addWidget(self.monitor_frame, stretch=1)
+        layout.addWidget(self.control_bar)
 
         self.controls_opacity_effect = QGraphicsOpacityEffect(self.control_bar)
         self.controls_opacity_effect.setOpacity(1.0)
@@ -228,42 +350,89 @@ class MediaCenterWindow(QMainWindow):
         self.controls_fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.controls_fade_animation.finished.connect(self._on_controls_fade_finished)
 
+        self.setMouseTracking(True)
+        for widget in (self.video_widget, self.no_signal, self.control_bar):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
+        return panel
+
+    def _build_control_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("controlBar")
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(4, 8, 4, 2)
+        layout.setSpacing(8)
+
+        self.progress = SeekSlider(Qt.Orientation.Horizontal)
+        # Arrow keys belong to the window's skip handling, not the slider.
+        self.progress.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.progress.setObjectName("seekBar")
+        self.progress.setRange(0, 1000)
+        self.progress.setSingleStep(1)
+        self.progress.setPageStep(50)
+        self.progress.setToolTip("Drag to seek")
+        self.progress.sliderPressed.connect(self._on_seek_start)
+        self.progress.sliderReleased.connect(self._on_seek_end)
+        self.progress.sliderMoved.connect(self._on_seek_preview)
+        self.progress.actionTriggered.connect(self._on_seek_action)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        self.prev_button = make_button("◀◀", "transport", "Previous in queue")
+        self.play_pause_button = make_button("▶  PLAY", "primary", "Play / pause (Space)")
+        self.play_pause_button.setMinimumWidth(110)
+        self.next_button = make_button("▶▶", "transport", "Next in queue")
+
+        now_playing = QVBoxLayout()
+        now_playing.setSpacing(0)
+        self.now_playing_label = make_label("NO SIGNAL", "nowPlaying")
+        self.now_playing_meta = make_label("NOTHING LOADED", "nowPlayingMeta")
+        now_playing.addWidget(self.now_playing_label)
+        now_playing.addWidget(self.now_playing_meta)
+
+        timecode = QVBoxLayout()
+        timecode.setSpacing(0)
+        timecode.addWidget(make_label("ELAPSED / TOTAL", "timecodeCaption"), alignment=Qt.AlignmentFlag.AlignRight)
+        self.position_label = make_label("00:00 / 00:00", "timecode")
+        timecode.addWidget(self.position_label, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.mute_button = make_button("VOL", "small", "Mute / unmute")
+        self.mute_button.setCheckable(True)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setFixedWidth(110)
+        self.volume_slider.setValue(round(self.audio_output.volume() * 100))
+        self.volume_slider.setToolTip("Volume")
+
+        self.tabs_toggle_button = make_button("▾  PANEL", None, "Hide / show the lower panel")
+        self.fullscreen_button = make_button("⛶  FULL", None, "Fullscreen (F / F11)")
+
+        row.addWidget(self.prev_button)
+        row.addWidget(self.play_pause_button)
+        row.addWidget(self.next_button)
+        row.addSpacing(10)
+        row.addLayout(now_playing, stretch=1)
+        row.addLayout(timecode)
+        row.addSpacing(14)
+        row.addWidget(self.mute_button)
+        row.addWidget(self.volume_slider)
+        row.addSpacing(14)
+        row.addWidget(self.tabs_toggle_button)
+        row.addWidget(self.fullscreen_button)
+
+        layout.addWidget(self.progress)
+        layout.addLayout(row)
+
         self.play_pause_button.clicked.connect(self.toggle_play_pause)
         self.next_button.clicked.connect(self.play_next)
         self.prev_button.clicked.connect(self.play_previous)
         self.tabs_toggle_button.clicked.connect(self.toggle_tabs_panel)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
-        self.progress.sliderPressed.connect(self._on_seek_start)
-        self.progress.sliderReleased.connect(self._on_seek_end)
-        self.progress.sliderMoved.connect(self._on_seek_preview)
-
-        self.setMouseTracking(True)
-        self.video_widget.setMouseTracking(True)
-        self.control_bar.setMouseTracking(True)
-        self.video_widget.installEventFilter(self)
-        self.control_bar.installEventFilter(self)
-
-        self.tabs = QTabWidget()
-        self.home_tab = self._build_home_tab()
-        self.library_tab = self._build_library_tab()
-        self.broadcast_tab = self._build_broadcast_tab()
-        self.tools_tab = self._build_tools_tab()
-        self.settings_tab = self._build_settings_tab()
-
-        self.tabs.addTab(self.home_tab, "Home")
-        self.tabs.addTab(self.library_tab, "Library")
-        self.tabs.addTab(self.broadcast_tab, "Broadcast")
-        self.tabs.addTab(self.tools_tab, "Tools")
-        self.tabs.addTab(self.settings_tab, "Settings")
-
-        root_layout.addWidget(player_box, stretch=3)
-        root_layout.addWidget(self.tabs, stretch=2)
-
-        self.setCentralWidget(root)
-
-        refresh_action = QAction("Refresh Library", self)
-        refresh_action.triggered.connect(self.refresh_library)
-        self.addAction(refresh_action)
+        self.mute_button.toggled.connect(self._on_mute_toggled)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        return bar
 
     def _install_shortcuts(self) -> None:
         self.shortcut_toggle_f11 = QShortcut(QKeySequence("F11"), self)
@@ -278,75 +447,123 @@ class MediaCenterWindow(QMainWindow):
         self.shortcut_exit_esc.setContext(Qt.ApplicationShortcut)
         self.shortcut_exit_esc.activated.connect(self.exit_fullscreen)
 
+        # Text fields consume a plain Space themselves, so this only fires outside of typing.
+        self.shortcut_play_pause = QShortcut(QKeySequence("Space"), self)
+        self.shortcut_play_pause.setContext(Qt.ApplicationShortcut)
+        self.shortcut_play_pause.activated.connect(self.toggle_play_pause)
+
     def eventFilter(self, watched, event) -> bool:
         if self.isFullScreen() and event.type() in (QEvent.Type.MouseMove, QEvent.Type.Enter):
             self._show_controls_temporarily()
         return super().eventFilter(watched, event)
 
+    def _notify(self, message: str, timeout_ms: int = 6000) -> None:
+        self.statusBar().showMessage(f">  {message}", timeout_ms)
+
     def _build_home_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        header = QLabel("Recently Viewed")
-        header.setStyleSheet("font-size: 18px; font-weight: 600;")
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.tile_series = ReadoutTile("SERIES")
+        self.tile_episodes = ReadoutTile("EPISODES")
+        self.tile_movies = ReadoutTile("MOVIES")
+        self.tile_queue = ReadoutTile("BROADCAST QUEUE")
+        for tile in (self.tile_series, self.tile_episodes, self.tile_movies, self.tile_queue):
+            tiles.addWidget(tile, stretch=1)
+
+        actions = QVBoxLayout()
+        actions.setSpacing(6)
+        resume_last = make_button("▶  CONTINUE LAST WATCHED", "primary", "Resume the series you watched most recently")
+        resume_broadcast = make_button("◉  RESUME BROADCAST", None, "Continue the saved broadcast playlist")
+        resume_last.clicked.connect(self._play_last_recent)
+        resume_broadcast.clicked.connect(self.play_generated_playlist)
+        actions.addWidget(resume_last)
+        actions.addWidget(resume_broadcast)
+        tiles.addLayout(actions)
+
+        self.recent_header = SectionHeader("RECENT ACTIVITY LOG", "DOUBLE-CLICK TO RESUME")
         self.recent_list = QListWidget()
+        self.recent_list.setIconSize(QSize(96, 54))
+        self.recent_list.setAlternatingRowColors(True)
         self.recent_list.itemDoubleClicked.connect(self._play_recent_item)
 
-        layout.addWidget(header)
-        layout.addWidget(self.recent_list)
+        layout.addLayout(tiles)
+        layout.addWidget(self.recent_header)
+        layout.addWidget(self.recent_list, stretch=1)
         return tab
 
     def _build_library_tab(self) -> QWidget:
         tab = QWidget()
         main = QVBoxLayout(tab)
+        main.setContentsMargins(12, 12, 12, 12)
+        main.setSpacing(8)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search title, series, or filename")
+        self.search_box.setPlaceholderText("SEARCH  //  title, series or filename")
+        self.search_box.setClearButtonEnabled(True)
         self.filter_box = QComboBox()
         self.filter_box.addItems(["All", "Movies", "Shows"])
         self.collection_filter_box = QComboBox()
         self.collection_filter_box.addItems(["All Status", "Completed", "In Progress", "Unspecified"])
-        refresh_btn = QPushButton("Refresh")
+        refresh_btn = make_button("⟳  RESCAN", None, "Rescan the shows and movies folders")
 
-        toolbar.addWidget(QLabel("Search:"))
         toolbar.addWidget(self.search_box, stretch=1)
-        toolbar.addWidget(QLabel("Filter:"))
+        toolbar.addWidget(make_label("TYPE", "fieldLabel"))
         toolbar.addWidget(self.filter_box)
-        toolbar.addWidget(QLabel("Collection:"))
+        toolbar.addWidget(make_label("STATUS", "fieldLabel"))
         toolbar.addWidget(self.collection_filter_box)
         toolbar.addWidget(refresh_btn)
 
         splitter = QSplitter()
         self.library_tree = QTreeWidget()
-        self.library_tree.setHeaderLabels(["Title", "Type", "Location"])
+        self.library_tree.setHeaderLabels(["TITLE", "TYPE / STATUS", "LOCATION"])
+        self.library_tree.setIconSize(QSize(48, 27))
+        self.library_tree.setAlternatingRowColors(True)
+        self.library_tree.setColumnWidth(0, 420)
+        self.library_tree.setColumnWidth(1, 120)
         self.library_tree.itemSelectionChanged.connect(self._on_library_selection)
         self.library_tree.itemDoubleClicked.connect(self._play_selected_library_item)
 
-        right = QWidget()
+        right = QFrame()
+        right.setObjectName("detailPanel")
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 10, 12, 12)
+        right_layout.setSpacing(8)
 
-        self.selected_title = QLabel("Select an item")
-        self.rating_spin = QSpinBox()
-        self.rating_spin.setRange(0, 5)
-        self.rating_spin.setToolTip("0 means unrated")
+        self.thumb_preview = make_label("NO IMAGE", "thumbPreview")
+        self.thumb_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb_preview.setFixedHeight(150)
+        self.selected_title = make_label("SELECT A DATA FILE", "detailTitle")
+        self.selected_title.setWordWrap(True)
+        self.selected_meta = make_label("", "detailMeta")
+        self.selected_meta.setWordWrap(True)
+        self.rating_bar = RatingBar()
         self.note_box = QTextEdit()
-        self.note_box.setPlaceholderText("Your review/notes...")
+        self.note_box.setPlaceholderText("Field notes / review...")
 
-        save_review = QPushButton("Save Review")
-        play_now = QPushButton("Play Selected")
-        set_thumbnail = QPushButton("Set Custom Image")
+        play_now = make_button("▶  PLAY", "primary", "Play this file; shows continue through the series")
+        save_review = make_button("SAVE REVIEW")
+        set_thumbnail = make_button("SET IMAGE", None, "Choose a custom thumbnail for this series / folder")
+        buttons = QHBoxLayout()
+        buttons.addWidget(play_now, stretch=1)
+        buttons.addWidget(save_review)
+        buttons.addWidget(set_thumbnail)
 
-        review_form = QFormLayout()
-        review_form.addRow("Title", self.selected_title)
-        review_form.addRow("Rating (0-5)", self.rating_spin)
-        review_form.addRow("Notes", self.note_box)
-
-        right_layout.addLayout(review_form)
-        right_layout.addWidget(save_review)
-        right_layout.addWidget(set_thumbnail)
-        right_layout.addWidget(play_now)
-        right_layout.addStretch(1)
+        right_layout.addWidget(SectionHeader("DATA FILE"))
+        right_layout.addWidget(self.thumb_preview)
+        right_layout.addWidget(self.selected_title)
+        right_layout.addWidget(self.selected_meta)
+        right_layout.addWidget(make_label("RATING", "fieldLabel"))
+        right_layout.addWidget(self.rating_bar)
+        right_layout.addWidget(make_label("NOTES", "fieldLabel"))
+        right_layout.addWidget(self.note_box, stretch=1)
+        right_layout.addLayout(buttons)
 
         splitter.addWidget(self.library_tree)
         splitter.addWidget(right)
@@ -354,7 +571,7 @@ class MediaCenterWindow(QMainWindow):
         splitter.setStretchFactor(1, 2)
 
         main.addLayout(toolbar)
-        main.addWidget(splitter)
+        main.addWidget(splitter, stretch=1)
 
         self.search_box.textChanged.connect(self.populate_library_tree)
         self.filter_box.currentIndexChanged.connect(self.populate_library_tree)
@@ -368,143 +585,157 @@ class MediaCenterWindow(QMainWindow):
 
     def _build_broadcast_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer = QHBoxLayout(tab)
+        outer.setContentsMargins(12, 4, 12, 12)
+        splitter = QSplitter()
 
-        settings_box = QGroupBox("Broadcast Generation")
+        left = QWidget()
+        layout = QVBoxLayout(left)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        settings_box = QGroupBox("BROADCAST GENERATION")
         settings_layout = QGridLayout(settings_box)
+        settings_layout.setHorizontalSpacing(10)
 
         self.bc_include_movies = QCheckBox("Interleave movies")
         self.bc_include_movies.setChecked(True)
 
         broadcast_state = self.state.data.get("broadcast", {})
-        self.bc_completed_only_default = QCheckBox("Include only Completed by default")
+        self.bc_completed_only_default = QCheckBox("Only COMPLETE series by default")
         self.bc_completed_only_default.setChecked(bool(broadcast_state.get("completed_only_default", True)))
 
         self.bc_movie_every = QSpinBox()
         self.bc_movie_every.setRange(1, 100)
         self.bc_movie_every.setValue(8)
+        self.bc_movie_every.setSuffix(" episodes")
+        self.bc_movie_every.setMaximumWidth(160)
 
         self.bc_output = QLineEdit(str(broadcast_state.get("output_path", str(DEFAULT_OUTPUT))))
-        output_btn = QPushButton("Browse")
+        output_btn = make_button("BROWSE")
 
+        self.bc_generate_btn = make_button("◉  GENERATE + GO ON AIR", "primary", "Build a new playlist and start it")
+        self.bc_play_btn = make_button("▶  PLAY SAVED", None, "Resume the playlist already saved to the M3U")
+
+        settings_layout.addWidget(self.bc_include_movies, 0, 0)
+        settings_layout.addWidget(self.bc_completed_only_default, 0, 1, 1, 2)
+        settings_layout.addWidget(make_label("MOVIE EVERY", "fieldLabel"), 1, 0)
+        settings_layout.addWidget(self.bc_movie_every, 1, 1, 1, 2)
+        settings_layout.addWidget(make_label("OUTPUT M3U", "fieldLabel"), 2, 0)
+        settings_layout.addWidget(self.bc_output, 2, 1)
+        settings_layout.addWidget(output_btn, 2, 2)
         settings_layout.addWidget(
-            QLabel("Broadcast always includes every episode from included shows."), 0, 0, 1, 3
+            make_label("Every episode of each included show is used. Broadcast playback loops forever.", "hint"),
+            3, 0, 1, 3,
         )
-        settings_layout.addWidget(self.bc_include_movies, 1, 0, 1, 2)
-        settings_layout.addWidget(self.bc_completed_only_default, 1, 2)
+        generate_row = QHBoxLayout()
+        generate_row.addWidget(self.bc_generate_btn, stretch=1)
+        generate_row.addWidget(self.bc_play_btn)
+        settings_layout.addLayout(generate_row, 4, 0, 1, 3)
 
-        settings_layout.addWidget(QLabel("Movie every N episodes"), 2, 0)
-        settings_layout.addWidget(self.bc_movie_every, 2, 1)
-
-        settings_layout.addWidget(QLabel("Output M3U"), 3, 0)
-        settings_layout.addWidget(self.bc_output, 3, 1)
-        settings_layout.addWidget(output_btn, 3, 2)
-
-        settings_layout.addWidget(QLabel("Playback loops forever when started from this tab."), 4, 0, 1, 3)
-
-        list_box = QGroupBox("Include / Exclude")
+        list_box = QGroupBox("INCLUDE / EXCLUDE")
         list_layout = QHBoxLayout(list_box)
-
         self.bc_show_list = QListWidget()
         self.bc_movie_list = QListWidget()
-        list_layout.addWidget(self._wrap_labeled_widget("Shows", self.bc_show_list))
-        list_layout.addWidget(self._wrap_labeled_widget("Movies", self.bc_movie_list))
+        list_layout.addWidget(self._wrap_labeled_widget("SHOWS", self.bc_show_list))
+        list_layout.addWidget(self._wrap_labeled_widget("MOVIES", self.bc_movie_list))
 
-        action_bar = QHBoxLayout()
-        self.bc_generate_btn = QPushButton("Generate Broadcast Playlist")
-        self.bc_play_btn = QPushButton("Play Generated Playlist")
-        self.bc_status = QLabel("")
+        layout.addWidget(settings_box)
+        layout.addWidget(list_box, stretch=1)
 
-        action_bar.addWidget(self.bc_generate_btn)
-        action_bar.addWidget(self.bc_play_btn)
-        action_bar.addWidget(self.bc_status, stretch=1)
+        right = QWidget()
+        queue_layout = QVBoxLayout(right)
+        queue_layout.setContentsMargins(0, 8, 0, 0)
+        self.bc_queue_header = SectionHeader("BROADCAST QUEUE", "EMPTY")
+        self.bc_queue_list = QListWidget()
+        self.bc_queue_list.setObjectName("queueList")
+        self.bc_queue_list.setAlternatingRowColors(True)
+        self.bc_queue_list.setIconSize(QSize(40, 22))
+        self.bc_queue_list.itemDoubleClicked.connect(self.play_selected_broadcast_item)
+        queue_actions = QHBoxLayout()
+        self.bc_jump_btn = make_button("▶  PLAY SELECTED")
+        self.bc_refresh_btn = make_button("LOAD FROM M3U")
+        self.bc_status = make_label("", "statusLine")
+        queue_actions.addWidget(self.bc_jump_btn)
+        queue_actions.addWidget(self.bc_refresh_btn)
+        queue_actions.addWidget(self.bc_status, stretch=1)
+
+        queue_layout.addWidget(self.bc_queue_header)
+        queue_layout.addWidget(self.bc_queue_list, stretch=1)
+        queue_layout.addLayout(queue_actions)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        outer.addWidget(splitter)
 
         output_btn.clicked.connect(self._browse_broadcast_output)
         self.bc_generate_btn.clicked.connect(self.generate_broadcast)
         self.bc_play_btn.clicked.connect(self.play_generated_playlist)
         self.bc_completed_only_default.stateChanged.connect(self._on_broadcast_default_filter_changed)
-
-        queue_box = QGroupBox("Broadcast Queue")
-        queue_layout = QVBoxLayout(queue_box)
-        self.bc_queue_list = QListWidget()
-        self.bc_queue_list.setAlternatingRowColors(True)
-        self.bc_queue_list.itemDoubleClicked.connect(self.play_selected_broadcast_item)
-        queue_actions = QHBoxLayout()
-        self.bc_jump_btn = QPushButton("Play Selected")
-        self.bc_refresh_btn = QPushButton("Load Queue From M3U")
-        queue_actions.addWidget(self.bc_jump_btn)
-        queue_actions.addWidget(self.bc_refresh_btn)
-        queue_actions.addStretch(1)
-
-        queue_layout.addWidget(self.bc_queue_list)
-        queue_layout.addLayout(queue_actions)
-
         self.bc_jump_btn.clicked.connect(self.play_selected_broadcast_item)
         self.bc_refresh_btn.clicked.connect(self.load_broadcast_queue_from_file)
-
-        layout.addWidget(settings_box)
-        layout.addWidget(list_box, stretch=1)
-        layout.addWidget(queue_box, stretch=2)
-        layout.addLayout(action_bar)
         return tab
 
     def _build_tools_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 4, 12, 12)
 
-        yt_box = QGroupBox("YouTube Rip")
+        yt_box = QGroupBox("YOUTUBE RIP")
         yt_layout = QGridLayout(yt_box)
 
         self.yt_url = QLineEdit()
-        self.yt_output = QLineEdit(str(BASE_DIR / "downloads"))
-        yt_output_btn = QPushButton("Browse")
+        self.yt_url.setPlaceholderText("https://www.youtube.com/watch?v=...")
+        self.yt_output = QLineEdit(str(OUTPUT_DIR / "downloads"))
+        yt_output_btn = make_button("BROWSE")
         self.yt_single = QCheckBox("Single video only")
-        self.yt_run_btn = QPushButton("Download")
+        self.yt_run_btn = make_button("⤓  DOWNLOAD", "primary")
 
-        yt_layout.addWidget(QLabel("URL"), 0, 0)
+        yt_layout.addWidget(make_label("URL", "fieldLabel"), 0, 0)
         yt_layout.addWidget(self.yt_url, 0, 1, 1, 2)
-        yt_layout.addWidget(QLabel("Output directory"), 1, 0)
+        yt_layout.addWidget(make_label("OUTPUT", "fieldLabel"), 1, 0)
         yt_layout.addWidget(self.yt_output, 1, 1)
         yt_layout.addWidget(yt_output_btn, 1, 2)
         yt_layout.addWidget(self.yt_single, 2, 1)
         yt_layout.addWidget(self.yt_run_btn, 2, 2)
+        yt_layout.setRowStretch(3, 1)
 
-        split_box = QGroupBox("Timestamp Splitter")
+        split_box = QGroupBox("TIMESTAMP SPLITTER")
         split_layout = QGridLayout(split_box)
 
         self.ts_input = QLineEdit()
         self.ts_marks = QLineEdit(str(BASE_DIR / "timestamps.txt"))
-        self.ts_output = QLineEdit(str(BASE_DIR / "split_output"))
+        self.ts_output = QLineEdit(str(OUTPUT_DIR / "split_output"))
         self.ts_ffmpeg_bin = QLineEdit("")
+        self.ts_ffmpeg_bin.setPlaceholderText("optional — uses PATH")
         self.ts_reencode = QCheckBox("Re-encode")
-        self.ts_run_btn = QPushButton("Split")
+        self.ts_run_btn = make_button("✂  SPLIT", "primary")
 
-        ts_input_btn = QPushButton("Browse")
-        ts_marks_btn = QPushButton("Browse")
-        ts_output_btn = QPushButton("Browse")
-        ts_ffmpeg_btn = QPushButton("Browse")
+        ts_input_btn = make_button("BROWSE")
+        ts_marks_btn = make_button("BROWSE")
+        ts_output_btn = make_button("BROWSE")
+        ts_ffmpeg_btn = make_button("BROWSE")
 
-        split_layout.addWidget(QLabel("Input media"), 0, 0)
-        split_layout.addWidget(self.ts_input, 0, 1)
-        split_layout.addWidget(ts_input_btn, 0, 2)
-
-        split_layout.addWidget(QLabel("Timestamp file"), 1, 0)
-        split_layout.addWidget(self.ts_marks, 1, 1)
-        split_layout.addWidget(ts_marks_btn, 1, 2)
-
-        split_layout.addWidget(QLabel("Output directory"), 2, 0)
-        split_layout.addWidget(self.ts_output, 2, 1)
-        split_layout.addWidget(ts_output_btn, 2, 2)
-
-        split_layout.addWidget(QLabel("FFmpeg bin (optional)"), 3, 0)
-        split_layout.addWidget(self.ts_ffmpeg_bin, 3, 1)
-        split_layout.addWidget(ts_ffmpeg_btn, 3, 2)
+        for row, (label, field, button) in enumerate(
+            [
+                ("INPUT", self.ts_input, ts_input_btn),
+                ("TIMESTAMPS", self.ts_marks, ts_marks_btn),
+                ("OUTPUT", self.ts_output, ts_output_btn),
+                ("FFMPEG BIN", self.ts_ffmpeg_bin, ts_ffmpeg_btn),
+            ]
+        ):
+            split_layout.addWidget(make_label(label, "fieldLabel"), row, 0)
+            split_layout.addWidget(field, row, 1)
+            split_layout.addWidget(button, row, 2)
 
         split_layout.addWidget(self.ts_reencode, 4, 1)
         split_layout.addWidget(self.ts_run_btn, 4, 2)
 
         self.tools_log = QPlainTextEdit()
+        self.tools_log.setObjectName("terminal")
         self.tools_log.setReadOnly(True)
+        self.tools_log.setPlaceholderText("> awaiting tasks_")
 
         yt_output_btn.clicked.connect(lambda: self._browse_dir_into(self.yt_output))
         self.yt_run_btn.clicked.connect(self.run_youtube_download)
@@ -515,28 +746,41 @@ class MediaCenterWindow(QMainWindow):
         ts_ffmpeg_btn.clicked.connect(lambda: self._browse_dir_into(self.ts_ffmpeg_bin))
         self.ts_run_btn.clicked.connect(self.run_timestamp_splitter)
 
-        layout.addWidget(yt_box)
-        layout.addWidget(split_box)
+        boxes = QHBoxLayout()
+        boxes.addWidget(yt_box, stretch=1)
+        boxes.addWidget(split_box, stretch=1)
+        layout.addLayout(boxes)
+        layout.addWidget(SectionHeader("TERMINAL", "TASK OUTPUT"))
         layout.addWidget(self.tools_log, stretch=1)
         return tab
 
+    def _log(self, message: str) -> None:
+        self.tools_log.appendPlainText(f"[{datetime.now():%H:%M:%S}] > {message}")
+
     def _build_settings_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        outer = QHBoxLayout(tab)
+        outer.setContentsMargins(12, 4, 12, 12)
 
         settings = self.state.data.get("settings", {})
+
+        config_box = QGroupBox("SYSTEM CONFIGURATION")
+        layout = QFormLayout(config_box)
+        layout.setVerticalSpacing(10)
 
         self.set_shows_dir = QLineEdit(settings.get("shows_dir", str(SHOWS_DIR)))
         self.set_movies_dir = QLineEdit(settings.get("movies_dir", str(MOVIES_DIR)))
         self.set_skip_seconds = QSpinBox()
         self.set_skip_seconds.setRange(1, 60)
+        self.set_skip_seconds.setSuffix(" s")
+        self.set_skip_seconds.setMaximumWidth(120)
         self.set_skip_seconds.setValue(int(settings.get("skip_seconds", 5)))
         self.set_autoplay = QCheckBox("Autoplay next item")
         self.set_autoplay.setChecked(bool(settings.get("autoplay", True)))
 
-        shows_browse = QPushButton("Browse")
-        movies_browse = QPushButton("Browse")
-        save_button = QPushButton("Save Settings")
+        shows_browse = make_button("BROWSE")
+        movies_browse = make_button("BROWSE")
+        save_button = make_button("SAVE CONFIGURATION", "primary")
 
         shows_line = self._with_button(self.set_shows_dir, shows_browse)
         movies_line = self._with_button(self.set_movies_dir, movies_browse)
@@ -545,12 +789,30 @@ class MediaCenterWindow(QMainWindow):
         movies_browse.clicked.connect(lambda: self._browse_dir_into(self.set_movies_dir))
         save_button.clicked.connect(self.save_settings)
 
-        layout.addRow("Shows folder", shows_line)
-        layout.addRow("Movies folder", movies_line)
-        layout.addRow("Arrow key skip (seconds)", self.set_skip_seconds)
+        layout.addRow(make_label("SHOWS FOLDER", "fieldLabel"), shows_line)
+        layout.addRow(make_label("MOVIES FOLDER", "fieldLabel"), movies_line)
+        layout.addRow(make_label("ARROW-KEY SKIP", "fieldLabel"), self.set_skip_seconds)
         layout.addRow("", self.set_autoplay)
         layout.addRow("", save_button)
 
+        keys_box = QGroupBox("CONTROL REFERENCE")
+        keys = QGridLayout(keys_box)
+        keys.setVerticalSpacing(8)
+        for row, (key, action) in enumerate(
+            [
+                ("SPACE", "Play / pause"),
+                ("← / →", "Skip back / forward"),
+                ("F · F11", "Toggle fullscreen"),
+                ("ESC", "Exit fullscreen"),
+            ]
+        ):
+            keys.addWidget(make_label(key, "keyCap"), row, 0, alignment=Qt.AlignmentFlag.AlignLeft)
+            keys.addWidget(QLabel(action), row, 1)
+        keys.setColumnStretch(1, 1)
+        keys.setRowStretch(4, 1)
+
+        outer.addWidget(config_box, stretch=3)
+        outer.addWidget(keys_box, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
         return tab
 
     def _with_button(self, line_edit: QLineEdit, button: QPushButton) -> QWidget:
@@ -561,13 +823,26 @@ class MediaCenterWindow(QMainWindow):
         l.addWidget(button)
         return box
 
-    def _wrap_labeled_widget(self, label: str, widget: QWidget) -> QWidget:
+    def _wrap_labeled_widget(self, label: str, widget: QListWidget) -> QWidget:
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(label))
+        top = QHBoxLayout()
+        top.addWidget(make_label(label, "fieldLabel"))
+        top.addStretch(1)
+        all_btn = make_button("ALL", "small", f"Include every entry in {label.lower()}")
+        none_btn = make_button("NONE", "small", f"Exclude every entry in {label.lower()}")
+        all_btn.clicked.connect(lambda: self._set_all_checked(widget, Qt.Checked))
+        none_btn.clicked.connect(lambda: self._set_all_checked(widget, Qt.Unchecked))
+        top.addWidget(all_btn)
+        top.addWidget(none_btn)
+        layout.addLayout(top)
         layout.addWidget(widget)
         return box
+
+    def _set_all_checked(self, widget: QListWidget, state: Qt.CheckState) -> None:
+        for i in range(widget.count()):
+            widget.item(i).setCheckState(state)
 
     def _browse_dir_into(self, line_edit: QLineEdit) -> None:
         current = line_edit.text().strip() or str(BASE_DIR)
@@ -601,19 +876,80 @@ class MediaCenterWindow(QMainWindow):
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.play_pause_button.setText("Pause")
+            self.play_pause_button.setText("❚❚  PAUSE")
         else:
-            self.play_pause_button.setText("Play")
+            self.play_pause_button.setText("▶  PLAY")
+        self._update_magi()
+
+    def _on_volume_changed(self, value: int) -> None:
+        self.audio_output.setVolume(value / 100)
+        self.state.data.setdefault("settings", {})["volume"] = value
+        if value and self.mute_button.isChecked():
+            self.mute_button.setChecked(False)
+
+    def _on_mute_toggled(self, muted: bool) -> None:
+        self.audio_output.setMuted(muted)
+        self.mute_button.setText("MUTE" if muted else "VOL")
+        self.mute_button.setProperty("variant", "danger" if muted else "small")
+        repolish(self.mute_button)
+
+    def _update_magi(self) -> None:
+        lights = self.header.lights
+
+        if self.media_items:
+            lights["library"].set_state(f"{len(self.media_items)} FILES", "ok")
+        else:
+            lights["library"].set_state("NO DATA", "alert")
+
+        on_air = self.current_queue_kind == "broadcast" and self.current_queue == self.broadcast_queue
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if on_air and playing:
+            lights["broadcast"].set_state("ON AIR", "alert")
+        elif self.broadcast_queue:
+            lights["broadcast"].set_state(f"QUEUE {len(self.broadcast_queue)}", "busy")
+        else:
+            lights["broadcast"].set_state("STANDBY", "idle")
+
+        if playing:
+            lights["player"].set_state("PLAYING", "ok")
+        elif self.current_queue:
+            lights["player"].set_state("PAUSED", "busy")
+        else:
+            lights["player"].set_state("NO SIGNAL", "idle")
+
+    def _update_now_playing(self) -> None:
+        if not self.current_queue or not (0 <= self.current_index < len(self.current_queue)):
+            self.now_playing_label.setText("NO SIGNAL")
+            self.now_playing_meta.setText("NOTHING LOADED")
+            self.queue_pos_label.setText("")
+            mode, badge = "idle", "STANDBY"
+        else:
+            path = self.current_queue[self.current_index]
+            media = self._media_item_for_path(path)
+            self.now_playing_label.setText(path.stem)
+            if media:
+                status, clean_group = parse_collection_tag(media.group)
+                self.now_playing_meta.setText(f"{clean_group.upper()}  //  {media.kind.upper()}")
+            else:
+                self.now_playing_meta.setText(str(path.parent))
+            total = len(self.current_queue)
+            prefix = "CH" if self.current_queue_kind == "broadcast" else "EP"
+            self.queue_pos_label.setText(f"{prefix} {self.current_index + 1:03d} / {total:03d}" if total > 1 else "")
+            if self.current_queue_kind == "broadcast":
+                mode, badge = "broadcast", "◉ BROADCAST"
+            elif total > 1:
+                mode, badge = "manual", "SERIES"
+            else:
+                mode, badge = "manual", "SINGLE"
+        self.mode_badge.setText(badge)
+        self.mode_badge.setProperty("mode", mode)
+        repolish(self.mode_badge)
+        self._update_magi()
 
     def toggle_tabs_panel(self) -> None:
         tabs_visible = self.tabs.isVisible()
         self.tabs.setVisible(not tabs_visible)
-        if tabs_visible:
-            self.tabs_toggle_button.setText("Show Tabs")
-            self.tabs_toggle_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
-        else:
-            self.tabs_toggle_button.setText("Hide Tabs")
-            self.tabs_toggle_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        self.tabs_toggle_button.setText("▴  PANEL" if tabs_visible else "▾  PANEL")
 
     def _thumbnail_key(self, media: MediaItem) -> str:
         return f"{media.kind}:{media.group}"
@@ -661,19 +997,40 @@ class MediaCenterWindow(QMainWindow):
             return None
         return None
 
-    def _icon_for_media_item(self, media: MediaItem) -> QIcon:
+    def _thumbnail_path_for_media(self, media: MediaItem) -> Path | None:
         key = self._thumbnail_key(media)
         custom = self.state.data.get("custom_thumbnails", {}).get(key)
         if custom and Path(custom).exists():
-            return QIcon(custom)
+            return Path(custom)
 
         source_video = self.group_first_media.get(key)
         if source_video and source_video.exists():
             auto_thumb = self._ensure_auto_thumbnail_for_key(key, source_video)
             if auto_thumb and auto_thumb.exists():
-                return QIcon(str(auto_thumb))
+                return auto_thumb
+        return None
 
+    def _icon_for_media_item(self, media: MediaItem) -> QIcon:
+        thumb = self._thumbnail_path_for_media(media)
+        if thumb:
+            return QIcon(str(thumb))
         return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+    def _show_thumbnail_preview(self, media: MediaItem | None) -> None:
+        thumb = self._thumbnail_path_for_media(media) if media else None
+        pixmap = QPixmap(str(thumb)) if thumb else QPixmap()
+        if pixmap.isNull():
+            self.thumb_preview.setPixmap(QPixmap())
+            self.thumb_preview.setText("NO IMAGE")
+            return
+        self.thumb_preview.setPixmap(
+            pixmap.scaled(
+                self.thumb_preview.width() - 2,
+                self.thumb_preview.height() - 2,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def _media_item_for_path(self, path: Path) -> MediaItem | None:
         existing = self.media_lookup.get(str(path))
@@ -742,6 +1099,8 @@ class MediaCenterWindow(QMainWindow):
         key = self._thumbnail_key(media)
         self.state.data.setdefault("custom_thumbnails", {})[key] = image_path
         self.state.save()
+        self._show_thumbnail_preview(media)
+        self._notify(f"CUSTOM IMAGE SET FOR {parse_collection_tag(media.group)[1].upper()}")
         self.populate_library_tree()
         self.refresh_recent_view()
         self._set_broadcast_queue_view(self.broadcast_queue)
@@ -817,6 +1176,16 @@ class MediaCenterWindow(QMainWindow):
 
         self.populate_library_tree()
         self.refresh_broadcast_lists()
+        self._update_library_readouts()
+        self._update_magi()
+        self._notify(f"LIBRARY SCAN COMPLETE  //  {len(self.media_items)} FILES")
+
+    def _update_library_readouts(self) -> None:
+        shows = [m for m in self.media_items if m.kind == "Show"]
+        self.tile_series.set_value(f"{len({m.group for m in shows}):03d}")
+        self.tile_episodes.set_value(f"{len(shows):04d}")
+        self.tile_movies.set_value(f"{len(self.media_items) - len(shows):03d}")
+        self.tile_queue.set_value(f"{len(self.broadcast_queue):04d}")
 
     def populate_library_tree(self) -> None:
         query = self.search_box.text().strip().lower()
@@ -841,14 +1210,21 @@ class MediaCenterWindow(QMainWindow):
 
             grouped.setdefault(item.group, []).append(item)
 
-        for group_name in sorted(grouped):
+        for group_name in sorted(grouped, key=lambda name: parse_collection_tag(name)[1].lower()):
             status, clean_group_name = parse_collection_tag(group_name)
-            parent_label = f"{clean_group_name} [{status_badge_text(status)}]"
-            parent = QTreeWidgetItem([parent_label, "", ""])
+            count = len(grouped[group_name])
+            parent = QTreeWidgetItem([clean_group_name, status_badge_text(status), f"{count} file{'s' if count != 1 else ''}"])
+            parent.setForeground(1, QBrush(QColor(theme.STATUS_COLORS.get(status, theme.TEXT_DIM))))
+            parent.setForeground(2, QBrush(QColor(theme.TEXT_DIM)))
+            title_font = parent.font(0)
+            title_font.setBold(True)
+            parent.setFont(0, title_font)
             group_icon_set = False
             self.library_tree.addTopLevelItem(parent)
-            for media in sorted(grouped[group_name], key=lambda m: m.title.lower()):
-                child = QTreeWidgetItem([media.title, media.kind, str(media.path)])
+            for media in sorted(grouped[group_name], key=lambda m: self._natural_text_key(m.title)):
+                child = QTreeWidgetItem([media.title, media.kind.upper(), str(media.path)])
+                child.setForeground(1, QBrush(QColor(theme.ORANGE_DIM)))
+                child.setForeground(2, QBrush(QColor(theme.TEXT_DIM)))
                 icon = self._icon_for_media_item(media)
                 child.setIcon(0, icon)
                 child.setData(0, Qt.UserRole, str(media.path))
@@ -894,9 +1270,14 @@ class MediaCenterWindow(QMainWindow):
         if not media:
             return
 
+        status, clean_group = parse_collection_tag(media.group)
         self.selected_title.setText(media.title)
+        self.selected_meta.setText(
+            f"{clean_group.upper()}  //  {media.kind.upper()}  //  {status_badge_text(status)}\n{media.path.name}"
+        )
+        self._show_thumbnail_preview(media)
         review = self.state.data.get("reviews", {}).get(path_str, {})
-        self.rating_spin.setValue(int(review.get("rating", 0)))
+        self.rating_bar.setValue(int(review.get("rating", 0)))
         self.note_box.setPlainText(review.get("note", ""))
 
     def save_current_review(self) -> None:
@@ -911,12 +1292,12 @@ class MediaCenterWindow(QMainWindow):
             return
 
         self.state.data.setdefault("reviews", {})[path_str] = {
-            "rating": self.rating_spin.value(),
+            "rating": self.rating_bar.value(),
             "note": self.note_box.toPlainText().strip(),
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
         self.state.save()
-        QMessageBox.information(self, "Review", "Review saved.")
+        self._notify(f"REVIEW SAVED  //  {Path(path_str).stem}")
 
     def _play_selected_library_item(self) -> None:
         items = self.library_tree.selectedItems()
@@ -941,7 +1322,19 @@ class MediaCenterWindow(QMainWindow):
         if not path.exists():
             QMessageBox.warning(self, "Missing File", f"File not found:\n{path}")
             return
-        self.play_paths([path], start_index=0, loop=False)
+        # Resume within the whole series so autoplay carries on to the next episode.
+        media = self.media_lookup.get(str(path))
+        if media:
+            queue, start_index = self._series_queue_for_media(media)
+            self.play_paths(queue, start_index=start_index, loop=False)
+        else:
+            self.play_paths([path], start_index=0, loop=False)
+
+    def _play_last_recent(self) -> None:
+        if self.recent_list.count() == 0:
+            self._notify("NO RECENT ACTIVITY TO RESUME")
+            return
+        self._play_recent_item(self.recent_list.item(0))
 
     def play_paths(
         self,
@@ -969,6 +1362,8 @@ class MediaCenterWindow(QMainWindow):
 
         current_path = self.current_queue[self.current_index]
         self.player.setSource(QUrl.fromLocalFile(str(current_path)))
+        self.monitor_stack.setCurrentWidget(self.video_widget)
+        self._update_now_playing()
         if autoplay:
             self.player.play()
         else:
@@ -1002,8 +1397,10 @@ class MediaCenterWindow(QMainWindow):
     def _set_broadcast_queue_view(self, paths: list[Path]) -> None:
         self.broadcast_queue = paths[:]
         self.bc_queue_list.clear()
+        self.bc_queue_header.set_code(f"{len(paths)} ITEMS" if paths else "EMPTY")
+        self.tile_queue.set_value(f"{len(paths):04d}")
         for idx, path in enumerate(paths, start=1):
-            label = f"{idx:04d}  |  {path.name}"
+            label = f"{idx:04d}  {path.stem}"
             item = QListWidgetItem(label)
             media = self._media_item_for_path(path)
             if media:
@@ -1172,6 +1569,12 @@ class MediaCenterWindow(QMainWindow):
         preview_position = int((slider_value / 1000.0) * duration)
         self.position_label.setText(f"{self._fmt_time(preview_position)} / {self._fmt_time(duration)}")
 
+    def _on_seek_action(self, _action: int) -> None:
+        # Mouse-wheel / page steps change the slider without a press/release pair;
+        # drags are left to _on_seek_end.
+        if not self.progress.isSliderDown():
+            self._seek_to_slider_value(self.progress.sliderPosition())
+
     def _on_seek_end(self) -> None:
         self._seek_to_slider_value(self.progress.value())
         self.is_seeking = False
@@ -1222,8 +1625,9 @@ class MediaCenterWindow(QMainWindow):
         # Keep player controls available in fullscreen by fullscreening the app window,
         # not just the raw video surface.
         self.tabs.setVisible(False)
+        self._set_chrome_visible(False)
         self.showFullScreen()
-        self.fullscreen_button.setText("Exit Fullscreen")
+        self.fullscreen_button.setText("⛶  EXIT")
         self.controls_opacity_effect.setOpacity(1.0)
         self.control_bar.setVisible(True)
         self._show_controls_temporarily()
@@ -1233,10 +1637,19 @@ class MediaCenterWindow(QMainWindow):
         if self.isFullScreen():
             self.showNormal()
             self.tabs.setVisible(True)
+            self.tabs_toggle_button.setText("▾  PANEL")
+        self._set_chrome_visible(True)
         self.controls_fade_animation.stop()
         self.controls_opacity_effect.setOpacity(1.0)
         self.control_bar.setVisible(True)
-        self.fullscreen_button.setText("Fullscreen")
+        self.fullscreen_button.setText("⛶  FULL")
+
+    def _set_chrome_visible(self, visible: bool) -> None:
+        """Header, stripe, frame borders and status bar give way to the picture in fullscreen."""
+        for widget in (self.header, self.header_stripe, self.monitor_header, self.statusBar()):
+            widget.setVisible(visible)
+        margin = 10 if visible else 0
+        self.body_layout.setContentsMargins(margin, margin, margin, 6 if visible else 0)
 
     def _add_recent(self, path: Path) -> None:
         now = datetime.now().isoformat(timespec="seconds")
@@ -1252,12 +1665,19 @@ class MediaCenterWindow(QMainWindow):
         self.recent_list.clear()
         for row in self.state.data.get("recent", []):
             path = row.get("path", "")
-            played = row.get("last_played", "")
-            label = f"{Path(path).name}   |   {played}"
-            item = QListWidgetItem(label)
+            played = friendly_timestamp(row.get("last_played", ""))
             media = self._media_item_for_path(Path(path))
             if media:
+                group = parse_collection_tag(media.group)[1].upper()
+                subtitle = f"{group}  //  {media.kind.upper()}  //  {played}"
+            else:
+                subtitle = played
+            item = QListWidgetItem(f"{Path(path).stem}\n{subtitle}")
+            if media:
                 item.setIcon(self._icon_for_media_item(media))
+            if not Path(path).exists():
+                item.setForeground(QBrush(QColor(theme.DISABLED)))
+                item.setToolTip("File no longer exists")
             item.setData(Qt.UserRole, path)
             self.recent_list.addItem(item)
 
@@ -1278,7 +1698,8 @@ class MediaCenterWindow(QMainWindow):
 
         for show_name in sorted(shows):
             status, clean_name = parse_collection_tag(show_name)
-            item = QListWidgetItem(f"{clean_name} [{status_badge_text(status)}]")
+            item = QListWidgetItem(f"{clean_name}  ·  {status_badge_text(status)}")
+            item.setForeground(QBrush(QColor(theme.STATUS_COLORS.get(status, theme.TEXT_DIM))))
             item.setData(Qt.UserRole, show_name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             default_unchecked = completed_only_default and status != "Completed"
@@ -1412,7 +1833,7 @@ class MediaCenterWindow(QMainWindow):
 
     def run_youtube_download(self) -> None:
         url = self.yt_url.text().strip()
-        output_dir = Path(self.yt_output.text().strip() or str(BASE_DIR / "downloads"))
+        output_dir = Path(self.yt_output.text().strip() or str(OUTPUT_DIR / "downloads"))
         single = self.yt_single.isChecked()
 
         if not url:
@@ -1420,35 +1841,26 @@ class MediaCenterWindow(QMainWindow):
             return
 
         self.yt_run_btn.setEnabled(False)
-        self.tools_log.appendPlainText("Starting download...")
+        self._log("Starting download...")
 
         def job() -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             download_url = resolve_download_url(url, single)
-            ydl_opts = {
-                "outtmpl": str(output_dir / "%(playlist_title|uploader)s" / "%(title)s.%(ext)s"),
-                "format": "best[ext=mp4]/best",
-                "merge_output_format": "mp4",
-                "noplaylist": single,
-                "ignoreerrors": True,
-                "restrictfilenames": False,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([download_url])
+            download_with_fallback(download_url=download_url, output_dir=output_dir, single=single)
 
         def done(message: str, ok: bool) -> None:
             self.yt_run_btn.setEnabled(True)
             if ok:
-                self.tools_log.appendPlainText("YouTube download completed.")
+                self._log("YouTube download completed.")
             else:
-                self.tools_log.appendPlainText("YouTube download failed:\n" + message)
+                self._log("YouTube download failed:\n" + message)
 
         self._threaded(job, done)
 
     def run_timestamp_splitter(self) -> None:
         input_file = Path(self.ts_input.text().strip())
         marks_file = Path(self.ts_marks.text().strip())
-        output_dir = Path(self.ts_output.text().strip() or str(BASE_DIR / "split_output"))
+        output_dir = Path(self.ts_output.text().strip() or str(OUTPUT_DIR / "split_output"))
         ffmpeg_bin_text = self.ts_ffmpeg_bin.text().strip()
         ffmpeg_bin = Path(ffmpeg_bin_text) if ffmpeg_bin_text else None
         reencode = self.ts_reencode.isChecked()
@@ -1461,7 +1873,7 @@ class MediaCenterWindow(QMainWindow):
             return
 
         self.ts_run_btn.setEnabled(False)
-        self.tools_log.appendPlainText("Starting timestamp split...")
+        self._log("Starting timestamp split...")
 
         def job() -> None:
             split_media(
@@ -1475,9 +1887,9 @@ class MediaCenterWindow(QMainWindow):
         def done(message: str, ok: bool) -> None:
             self.ts_run_btn.setEnabled(True)
             if ok:
-                self.tools_log.appendPlainText("Timestamp split completed.")
+                self._log("Timestamp split completed.")
             else:
-                self.tools_log.appendPlainText("Timestamp split failed:\n" + message)
+                self._log("Timestamp split failed:\n" + message)
 
         self._threaded(job, done)
 
@@ -1491,7 +1903,7 @@ class MediaCenterWindow(QMainWindow):
 
         self.refresh_library()
         self.refresh_broadcast_lists()
-        QMessageBox.information(self, "Settings", "Settings saved.")
+        self._notify("CONFIGURATION SAVED")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._persist_broadcast_resume_state()
@@ -1524,6 +1936,7 @@ class _CallbackEvent(QEvent):
 
 def main() -> int:
     app = QApplication([])
+    theme.apply_theme(app)
     window = MediaCenterWindow()
     window.show()
     return app.exec()
