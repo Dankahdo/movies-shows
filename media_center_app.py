@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,11 +14,12 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -51,10 +53,23 @@ from PySide6.QtWidgets import (
 )
 
 import nerv_theme as theme
+from nerv_panels import (
+    AMBER_INK,
+    AmberTitleBar,
+    BlinkBadge,
+    GlowTitle,
+    HarmonicsBackdrop,
+    ProgramDirectionGraph,
+    ScanOverlay,
+    StickySeriesBar,
+    SyncMeterPanel,
+    TaskMonitor,
+)
 from nerv_theme import (
     HazardStripe,
     MonitorFrame,
     NervHeader,
+    NervTabWidget,
     NoSignalScreen,
     RatingBar,
     ReadoutTile,
@@ -79,6 +94,11 @@ from timestampSplitter import split_media
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".flv", ".webm"}
 APP_STATE_FILE = DATA_DIR / "app_state.json"
 THUMBNAILS_DIR = DATA_DIR / ".thumbnails"
+RESUME_SAVE_INTERVAL_S = 10
+RESUME_REWIND_MS = 3000
+RESUME_FINISHED_MARGIN_MS = 15000
+AMBER_STATUS_COLORS = {"Completed": "#0b5d1e", "In Progress": "#9a2200", "Unspecified": "#6b4a1f"}
+EPISODE_NUMBER_PATTERN = re.compile(r"(?:^|[-_ .])(\d{1,4})(?=[-_ .]|$)")
 COLLECTION_TAG_PATTERN = re.compile(r"^\(\s*(completed|complete|ip)\s*\)\s*", re.IGNORECASE)
 
 
@@ -225,6 +245,9 @@ class MediaCenterWindow(QMainWindow):
         self.is_seeking = False
         self.broadcast_queue: list[Path] = []
         self.pending_restore_position_ms: int | None = None
+        # File whose playback position is being recorded into its "recent" entry.
+        self.tracked_path: Path | None = None
+        self.last_position_save = 0.0
 
         self.controls_hide_timer = QTimer(self)
         self.controls_hide_timer.setSingleShot(True)
@@ -268,8 +291,7 @@ class MediaCenterWindow(QMainWindow):
 
         self.monitor_panel = self._build_monitor_panel()
 
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(False)
+        self.tabs = NervTabWidget()
         self.home_tab = self._build_home_tab()
         self.library_tab = self._build_library_tab()
         self.broadcast_tab = self._build_broadcast_tab()
@@ -462,44 +484,53 @@ class MediaCenterWindow(QMainWindow):
 
     def _build_home_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(22)
 
-        tiles = QHBoxLayout()
+        self.sync_meters = SyncMeterPanel()
+        self.sync_meters.setToolTip("Click a row to resume it · scroll for older activity")
+        self.sync_meters.activated.connect(self._play_recent_path)
+
+        side = QWidget()
+        side.setFixedWidth(340)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(10)
+
+        tiles = QGridLayout()
         tiles.setSpacing(10)
         self.tile_series = ReadoutTile("SERIES")
         self.tile_episodes = ReadoutTile("EPISODES")
         self.tile_movies = ReadoutTile("MOVIES")
         self.tile_queue = ReadoutTile("BROADCAST QUEUE")
-        for tile in (self.tile_series, self.tile_episodes, self.tile_movies, self.tile_queue):
-            tiles.addWidget(tile, stretch=1)
+        for i, tile in enumerate((self.tile_series, self.tile_episodes, self.tile_movies, self.tile_queue)):
+            tiles.addWidget(tile, i // 2, i % 2)
 
-        actions = QVBoxLayout()
-        actions.setSpacing(6)
-        resume_last = make_button("▶  CONTINUE LAST WATCHED", "primary", "Resume the series you watched most recently")
+        resume_last = make_button(
+            "▶  CONTINUE LAST WATCHED", "primary", "Reopen the last video at the point you left off"
+        )
+        resume_last.setMinimumHeight(46)
+        self.resume_hint = make_label("", "resumeHint")
+        self.resume_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         resume_broadcast = make_button("◉  RESUME BROADCAST", None, "Continue the saved broadcast playlist")
         resume_last.clicked.connect(self._play_last_recent)
         resume_broadcast.clicked.connect(self.play_generated_playlist)
-        actions.addWidget(resume_last)
-        actions.addWidget(resume_broadcast)
-        tiles.addLayout(actions)
 
-        self.recent_header = SectionHeader("RECENT ACTIVITY LOG", "DOUBLE-CLICK TO RESUME")
-        self.recent_list = QListWidget()
-        self.recent_list.setIconSize(QSize(96, 54))
-        self.recent_list.setAlternatingRowColors(True)
-        self.recent_list.itemDoubleClicked.connect(self._play_recent_item)
+        side_layout.addLayout(tiles)
+        side_layout.addStretch(1)
+        side_layout.addWidget(resume_last)
+        side_layout.addWidget(self.resume_hint)
+        side_layout.addWidget(resume_broadcast)
 
-        layout.addLayout(tiles)
-        layout.addWidget(self.recent_header)
-        layout.addWidget(self.recent_list, stretch=1)
+        layout.addWidget(self.sync_meters, stretch=1)
+        layout.addWidget(side)
         return tab
 
     def _build_library_tab(self) -> QWidget:
         tab = QWidget()
         main = QVBoxLayout(tab)
-        main.setContentsMargins(12, 12, 12, 12)
+        main.setContentsMargins(12, 10, 12, 12)
         main.setSpacing(8)
 
         toolbar = QHBoxLayout()
@@ -512,40 +543,92 @@ class MediaCenterWindow(QMainWindow):
         self.collection_filter_box = QComboBox()
         self.collection_filter_box.addItems(["All Status", "Completed", "In Progress", "Unspecified"])
         refresh_btn = make_button("⟳  RESCAN", None, "Rescan the shows and movies folders")
+        collapse_all_btn = make_button("⊟  COLLAPSE ALL", None, "Collapse every series back to a single row")
 
         toolbar.addWidget(self.search_box, stretch=1)
         toolbar.addWidget(make_label("TYPE", "fieldLabel"))
         toolbar.addWidget(self.filter_box)
         toolbar.addWidget(make_label("STATUS", "fieldLabel"))
         toolbar.addWidget(self.collection_filter_box)
+        toolbar.addWidget(collapse_all_btn)
         toolbar.addWidget(refresh_btn)
 
-        splitter = QSplitter()
+        # INDEX // STORED DATA: the library tree on an amber analysis panel.
+        index_column = QWidget()
+        index_layout = QVBoxLayout(index_column)
+        index_layout.setContentsMargins(0, 0, 0, 0)
+        index_layout.setSpacing(4)
+        index_panel = QFrame()
+        index_panel.setObjectName("amberPanel")
+        index_panel_layout = QVBoxLayout(index_panel)
+        index_panel_layout.setContentsMargins(0, 0, 0, 0)
+        index_panel_layout.setSpacing(0)
+
         self.library_tree = QTreeWidget()
-        self.library_tree.setHeaderLabels(["TITLE", "TYPE / STATUS", "LOCATION"])
+        self.library_tree.setObjectName("amberTree")
+        self.library_tree.setHeaderLabels(["SERIES / FILE", "STATUS", "FILES / LOCATION"])
         self.library_tree.setIconSize(QSize(48, 27))
         self.library_tree.setAlternatingRowColors(True)
         self.library_tree.setColumnWidth(0, 420)
         self.library_tree.setColumnWidth(1, 120)
+        tree_palette = self.library_tree.palette()
+        for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
+            tree_palette.setColor(role, QColor(AMBER_INK))
+        self.library_tree.setPalette(tree_palette)
         self.library_tree.itemSelectionChanged.connect(self._on_library_selection)
         self.library_tree.itemDoubleClicked.connect(self._play_selected_library_item)
+        self.library_scan = ScanOverlay(self.library_tree.viewport())
+        self.library_sticky = StickySeriesBar(self.library_tree)
 
-        right = QFrame()
-        right.setObjectName("detailPanel")
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(12, 10, 12, 12)
-        right_layout.setSpacing(8)
+        index_panel_layout.addWidget(AmberTitleBar("ARCHIVE ANALYSIS", "STORED DATA"))
+        index_panel_layout.addWidget(self.library_tree, stretch=1)
+        index_layout.addWidget(GlowTitle("INDEX"))
+        index_layout.addWidget(index_panel, stretch=1)
+
+        # SELECTED // REALTIME DATA: the selected file's detail panel.
+        detail_column = QWidget()
+        detail_layout = QVBoxLayout(detail_column)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(4)
+        detail_panel = QFrame()
+        detail_panel.setObjectName("amberPanel")
+        detail_panel_layout = QVBoxLayout(detail_panel)
+        detail_panel_layout.setContentsMargins(0, 0, 0, 0)
+        detail_panel_layout.setSpacing(0)
+        body = QWidget()
+        body.setObjectName("amberBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(12, 10, 12, 12)
+        body_layout.setSpacing(7)
 
         self.thumb_preview = make_label("NO IMAGE", "thumbPreview")
         self.thumb_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumb_preview.setFixedHeight(150)
+        self.thumb_preview.setFixedSize(200, 112)
         self.selected_title = make_label("SELECT A DATA FILE", "detailTitle")
         self.selected_title.setWordWrap(True)
         self.selected_meta = make_label("", "detailMeta")
         self.selected_meta.setWordWrap(True)
-        self.rating_bar = RatingBar()
+        heading = QVBoxLayout()
+        heading.setSpacing(4)
+        heading.addWidget(self.selected_title)
+        heading.addWidget(self.selected_meta)
+        heading.addStretch(1)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+        top_row.addWidget(self.thumb_preview, alignment=Qt.AlignmentFlag.AlignTop)
+        top_row.addLayout(heading, stretch=1)
+
+        self.rating_bar = RatingBar(on=AMBER_INK, off_fill="transparent", off_border=AMBER_INK, text=AMBER_INK)
+        rating_row = QHBoxLayout()
+        rating_row.addWidget(make_label("RATING", "fieldLabel"))
+        rating_row.addWidget(self.rating_bar)
+        rating_row.addStretch(1)
+
         self.note_box = QTextEdit()
         self.note_box.setPlaceholderText("Field notes / review...")
+        note_palette = self.note_box.palette()
+        note_palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7a4a1a"))
+        self.note_box.setPalette(note_palette)
 
         play_now = make_button("▶  PLAY", "primary", "Play this file; shows continue through the series")
         save_review = make_button("SAVE REVIEW")
@@ -555,18 +638,19 @@ class MediaCenterWindow(QMainWindow):
         buttons.addWidget(save_review)
         buttons.addWidget(set_thumbnail)
 
-        right_layout.addWidget(SectionHeader("DATA FILE"))
-        right_layout.addWidget(self.thumb_preview)
-        right_layout.addWidget(self.selected_title)
-        right_layout.addWidget(self.selected_meta)
-        right_layout.addWidget(make_label("RATING", "fieldLabel"))
-        right_layout.addWidget(self.rating_bar)
-        right_layout.addWidget(make_label("NOTES", "fieldLabel"))
-        right_layout.addWidget(self.note_box, stretch=1)
-        right_layout.addLayout(buttons)
+        body_layout.addLayout(top_row)
+        body_layout.addLayout(rating_row)
+        body_layout.addWidget(make_label("NOTES", "fieldLabel"))
+        body_layout.addWidget(self.note_box, stretch=1)
+        body_layout.addLayout(buttons)
+        detail_panel_layout.addWidget(AmberTitleBar("DATA FILE", "REALTIME DATA", blink=True))
+        detail_panel_layout.addWidget(body, stretch=1)
+        detail_layout.addWidget(GlowTitle("SELECTED"))
+        detail_layout.addWidget(detail_panel, stretch=1)
 
-        splitter.addWidget(self.library_tree)
-        splitter.addWidget(right)
+        splitter = QSplitter()
+        splitter.addWidget(index_column)
+        splitter.addWidget(detail_column)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
@@ -577,6 +661,7 @@ class MediaCenterWindow(QMainWindow):
         self.filter_box.currentIndexChanged.connect(self.populate_library_tree)
         self.collection_filter_box.currentIndexChanged.connect(self.populate_library_tree)
         refresh_btn.clicked.connect(self.refresh_library)
+        collapse_all_btn.clicked.connect(self._collapse_all_series)
         save_review.clicked.connect(self.save_current_review)
         set_thumbnail.clicked.connect(self.set_custom_thumbnail_for_selected)
         play_now.clicked.connect(self._play_selected_library_item)
@@ -586,66 +671,42 @@ class MediaCenterWindow(QMainWindow):
     def _build_broadcast_tab(self) -> QWidget:
         tab = QWidget()
         outer = QHBoxLayout(tab)
-        outer.setContentsMargins(12, 4, 12, 12)
+        outer.setContentsMargins(12, 10, 12, 12)
         splitter = QSplitter()
 
-        left = QWidget()
-        layout = QVBoxLayout(left)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        settings_box = QGroupBox("BROADCAST GENERATION")
-        settings_layout = QGridLayout(settings_box)
-        settings_layout.setHorizontalSpacing(10)
-
-        self.bc_include_movies = QCheckBox("Interleave movies")
-        self.bc_include_movies.setChecked(True)
-
-        broadcast_state = self.state.data.get("broadcast", {})
-        self.bc_completed_only_default = QCheckBox("Only COMPLETE series by default")
-        self.bc_completed_only_default.setChecked(bool(broadcast_state.get("completed_only_default", True)))
-
-        self.bc_movie_every = QSpinBox()
-        self.bc_movie_every.setRange(1, 100)
-        self.bc_movie_every.setValue(8)
-        self.bc_movie_every.setSuffix(" episodes")
-        self.bc_movie_every.setMaximumWidth(160)
-
-        self.bc_output = QLineEdit(str(broadcast_state.get("output_path", str(DEFAULT_OUTPUT))))
-        output_btn = make_button("BROWSE")
-
-        self.bc_generate_btn = make_button("◉  GENERATE + GO ON AIR", "primary", "Build a new playlist and start it")
-        self.bc_play_btn = make_button("▶  PLAY SAVED", None, "Resume the playlist already saved to the M3U")
-
-        settings_layout.addWidget(self.bc_include_movies, 0, 0)
-        settings_layout.addWidget(self.bc_completed_only_default, 0, 1, 1, 2)
-        settings_layout.addWidget(make_label("MOVIE EVERY", "fieldLabel"), 1, 0)
-        settings_layout.addWidget(self.bc_movie_every, 1, 1, 1, 2)
-        settings_layout.addWidget(make_label("OUTPUT M3U", "fieldLabel"), 2, 0)
-        settings_layout.addWidget(self.bc_output, 2, 1)
-        settings_layout.addWidget(output_btn, 2, 2)
-        settings_layout.addWidget(
-            make_label("Every episode of each included show is used. Broadcast playback loops forever.", "hint"),
-            3, 0, 1, 3,
-        )
-        generate_row = QHBoxLayout()
-        generate_row.addWidget(self.bc_generate_btn, stretch=1)
-        generate_row.addWidget(self.bc_play_btn)
-        settings_layout.addLayout(generate_row, 4, 0, 1, 3)
-
-        list_box = QGroupBox("INCLUDE / EXCLUDE")
-        list_layout = QHBoxLayout(list_box)
-        self.bc_show_list = QListWidget()
-        self.bc_movie_list = QListWidget()
-        list_layout.addWidget(self._wrap_labeled_widget("SHOWS", self.bc_show_list))
-        list_layout.addWidget(self._wrap_labeled_widget("MOVIES", self.bc_movie_list))
-
-        layout.addWidget(settings_box)
-        layout.addWidget(list_box, stretch=1)
+        self.bc_graph = ProgramDirectionGraph()
 
         right = QWidget()
-        queue_layout = QVBoxLayout(right)
-        queue_layout.setContentsMargins(0, 8, 0, 0)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        header = QHBoxLayout()
         self.bc_queue_header = SectionHeader("BROADCAST QUEUE", "EMPTY")
+        self.bc_onair = BlinkBadge()
+        header.addWidget(self.bc_queue_header, stretch=1)
+        header.addWidget(self.bc_onair)
+
+        # QUEUE / SOURCES switch keeps the include-exclude lists one click away.
+        switch = QHBoxLayout()
+        switch.setSpacing(4)
+        self.bc_view_queue = make_button("QUEUE", "small", "Show the generated broadcast queue")
+        self.bc_view_sources = make_button("SOURCES", "small", "Choose which shows and movies go into the broadcast")
+        view_group = QButtonGroup(self)
+        view_group.setExclusive(True)
+        for index, button in enumerate((self.bc_view_queue, self.bc_view_sources)):
+            button.setCheckable(True)
+            view_group.addButton(button, index)
+            switch.addWidget(button)
+        switch.addStretch(1)
+        self.bc_view_queue.setChecked(True)
+
+        self.bc_stack = QStackedWidget()
+        view_group.idClicked.connect(self.bc_stack.setCurrentIndex)
+
+        queue_page = QWidget()
+        queue_layout = QVBoxLayout(queue_page)
+        queue_layout.setContentsMargins(0, 0, 0, 0)
         self.bc_queue_list = QListWidget()
         self.bc_queue_list.setObjectName("queueList")
         self.bc_queue_list.setAlternatingRowColors(True)
@@ -658,15 +719,65 @@ class MediaCenterWindow(QMainWindow):
         queue_actions.addWidget(self.bc_jump_btn)
         queue_actions.addWidget(self.bc_refresh_btn)
         queue_actions.addWidget(self.bc_status, stretch=1)
-
-        queue_layout.addWidget(self.bc_queue_header)
         queue_layout.addWidget(self.bc_queue_list, stretch=1)
         queue_layout.addLayout(queue_actions)
 
-        splitter.addWidget(left)
+        sources_page = QWidget()
+        sources_layout = QVBoxLayout(sources_page)
+        sources_layout.setContentsMargins(0, 0, 0, 0)
+        settings_grid = QGridLayout()
+        settings_grid.setHorizontalSpacing(10)
+
+        broadcast_state = self.state.data.get("broadcast", {})
+        self.bc_include_movies = QCheckBox("Interleave movies")
+        self.bc_include_movies.setChecked(True)
+        self.bc_completed_only_default = QCheckBox("Only COMPLETE series by default")
+        self.bc_completed_only_default.setChecked(bool(broadcast_state.get("completed_only_default", True)))
+        self.bc_movie_every = QSpinBox()
+        self.bc_movie_every.setRange(1, 100)
+        self.bc_movie_every.setValue(8)
+        self.bc_movie_every.setSuffix(" episodes")
+        self.bc_movie_every.setMaximumWidth(160)
+        self.bc_output = QLineEdit(str(broadcast_state.get("output_path", str(DEFAULT_OUTPUT))))
+        output_btn = make_button("BROWSE")
+
+        settings_grid.addWidget(self.bc_include_movies, 0, 0)
+        settings_grid.addWidget(self.bc_completed_only_default, 0, 1, 1, 2)
+        settings_grid.addWidget(make_label("MOVIE EVERY", "fieldLabel"), 1, 0)
+        settings_grid.addWidget(self.bc_movie_every, 1, 1, 1, 2)
+        settings_grid.addWidget(make_label("OUTPUT M3U", "fieldLabel"), 2, 0)
+        settings_grid.addWidget(self.bc_output, 2, 1)
+        settings_grid.addWidget(output_btn, 2, 2)
+
+        self.bc_show_list = QListWidget()
+        self.bc_movie_list = QListWidget()
+        lists = QHBoxLayout()
+        lists.addWidget(self._wrap_labeled_widget("SHOWS", self.bc_show_list))
+        lists.addWidget(self._wrap_labeled_widget("MOVIES", self.bc_movie_list))
+        sources_layout.addLayout(settings_grid)
+        sources_layout.addWidget(
+            make_label("Every episode of each included show is used. Broadcast playback loops forever.", "hint")
+        )
+        sources_layout.addLayout(lists, stretch=1)
+
+        self.bc_stack.addWidget(queue_page)
+        self.bc_stack.addWidget(sources_page)
+
+        self.bc_generate_btn = make_button("◉  GENERATE + GO ON AIR", "primary", "Build a new playlist and start it")
+        self.bc_play_btn = make_button("▶  PLAY SAVED", None, "Resume the playlist already saved to the M3U")
+        generate_row = QHBoxLayout()
+        generate_row.addWidget(self.bc_generate_btn, stretch=1)
+        generate_row.addWidget(self.bc_play_btn)
+
+        right_layout.addLayout(header)
+        right_layout.addLayout(switch)
+        right_layout.addWidget(self.bc_stack, stretch=1)
+        right_layout.addLayout(generate_row)
+
+        splitter.addWidget(self.bc_graph)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 4)
         outer.addWidget(splitter)
 
         output_btn.clicked.connect(self._browse_broadcast_output)
@@ -680,7 +791,11 @@ class MediaCenterWindow(QMainWindow):
     def _build_tools_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 4, 12, 12)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(8)
+
+        self.task_monitor = TaskMonitor()
+        self.task_state = {"yt": "STANDBY", "split": "STANDBY"}
 
         yt_box = QGroupBox("YOUTUBE RIP")
         yt_layout = QGridLayout(yt_box)
@@ -736,6 +851,7 @@ class MediaCenterWindow(QMainWindow):
         self.tools_log.setObjectName("terminal")
         self.tools_log.setReadOnly(True)
         self.tools_log.setPlaceholderText("> awaiting tasks_")
+        self.tools_log.setMinimumHeight(60)
 
         yt_output_btn.clicked.connect(lambda: self._browse_dir_into(self.yt_output))
         self.yt_run_btn.clicked.connect(self.run_youtube_download)
@@ -745,28 +861,53 @@ class MediaCenterWindow(QMainWindow):
         ts_output_btn.clicked.connect(lambda: self._browse_dir_into(self.ts_output))
         ts_ffmpeg_btn.clicked.connect(lambda: self._browse_dir_into(self.ts_ffmpeg_bin))
         self.ts_run_btn.clicked.connect(self.run_timestamp_splitter)
+        self.yt_output.textChanged.connect(self._update_task_monitor)
+        self.ts_ffmpeg_bin.textChanged.connect(self._update_task_monitor)
 
         boxes = QHBoxLayout()
         boxes.addWidget(yt_box, stretch=1)
         boxes.addWidget(split_box, stretch=1)
+        layout.addWidget(self.task_monitor, stretch=2)
         layout.addLayout(boxes)
-        layout.addWidget(SectionHeader("TERMINAL", "TASK OUTPUT"))
         layout.addWidget(self.tools_log, stretch=1)
+        self._update_task_monitor()
         return tab
+
+    def _update_task_monitor(self) -> None:
+        if self.ts_ffmpeg_bin.text().strip():
+            ffmpeg = "CUSTOM BIN"
+        else:
+            ffmpeg = "SYSTEM PATH" if shutil.which("ffmpeg") else "NOT FOUND"
+        self.task_monitor.set_status(
+            yt=self.task_state["yt"],
+            split=self.task_state["split"],
+            ffmpeg=ffmpeg,
+            output=self.yt_output.text().strip() or str(OUTPUT_DIR),
+        )
+
+    def _set_task_state(self, task: str, state: str) -> None:
+        self.task_state[task] = state
+        self._update_task_monitor()
 
     def _log(self, message: str) -> None:
         self.tools_log.appendPlainText(f"[{datetime.now():%H:%M:%S}] > {message}")
 
     def _build_settings_tab(self) -> QWidget:
-        tab = QWidget()
-        outer = QHBoxLayout(tab)
-        outer.setContentsMargins(12, 4, 12, 12)
+        # The whole tab is the harmonics graph; the settings float over it.
+        self.harmonics = HarmonicsBackdrop()
+        outer = QHBoxLayout(self.harmonics)
+        outer.setContentsMargins(12, HarmonicsBackdrop.TOP_MARGIN, 16, 86)
+        outer.setSpacing(16)
 
         settings = self.state.data.get("settings", {})
 
-        config_box = QGroupBox("SYSTEM CONFIGURATION")
-        layout = QFormLayout(config_box)
-        layout.setVerticalSpacing(10)
+        config_box = QFrame()
+        config_box.setObjectName("harmonicsForm")
+        config_box.setMaximumWidth(760)
+        layout = QGridLayout(config_box)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(9)
 
         self.set_shows_dir = QLineEdit(settings.get("shows_dir", str(SHOWS_DIR)))
         self.set_movies_dir = QLineEdit(settings.get("movies_dir", str(MOVIES_DIR)))
@@ -782,38 +923,58 @@ class MediaCenterWindow(QMainWindow):
         movies_browse = make_button("BROWSE")
         save_button = make_button("SAVE CONFIGURATION", "primary")
 
-        shows_line = self._with_button(self.set_shows_dir, shows_browse)
-        movies_line = self._with_button(self.set_movies_dir, movies_browse)
-
         shows_browse.clicked.connect(lambda: self._browse_dir_into(self.set_shows_dir))
         movies_browse.clicked.connect(lambda: self._browse_dir_into(self.set_movies_dir))
         save_button.clicked.connect(self.save_settings)
 
-        layout.addRow(make_label("SHOWS FOLDER", "fieldLabel"), shows_line)
-        layout.addRow(make_label("MOVIES FOLDER", "fieldLabel"), movies_line)
-        layout.addRow(make_label("ARROW-KEY SKIP", "fieldLabel"), self.set_skip_seconds)
-        layout.addRow("", self.set_autoplay)
-        layout.addRow("", save_button)
+        skip_row = QHBoxLayout()
+        skip_row.setSpacing(18)
+        skip_row.addWidget(self.set_skip_seconds)
+        skip_row.addWidget(self.set_autoplay)
+        skip_row.addStretch(1)
 
-        keys_box = QGroupBox("CONTROL REFERENCE")
+        layout.addWidget(make_label("SHOWS FOLDER", "fieldLabel"), 0, 0)
+        layout.addWidget(self.set_shows_dir, 0, 1)
+        layout.addWidget(shows_browse, 0, 2)
+        layout.addWidget(make_label("MOVIES FOLDER", "fieldLabel"), 1, 0)
+        layout.addWidget(self.set_movies_dir, 1, 1)
+        layout.addWidget(movies_browse, 1, 2)
+        layout.addWidget(make_label("ARROW-KEY SKIP", "fieldLabel"), 2, 0)
+        layout.addLayout(skip_row, 2, 1)
+        layout.addWidget(save_button, 3, 1, 1, 2)
+
+        for signal in (
+            self.set_shows_dir.textChanged,
+            self.set_movies_dir.textChanged,
+            self.set_skip_seconds.valueChanged,
+            self.set_autoplay.toggled,
+        ):
+            signal.connect(lambda *_: self.harmonics.set_saved(False))
+
+        keys_box = QFrame()
+        keys_box.setObjectName("harmonicsForm")
+        keys_box.setFixedWidth(300)
         keys = QGridLayout(keys_box)
+        keys.setContentsMargins(14, 10, 14, 12)
         keys.setVerticalSpacing(8)
+        keys.addWidget(make_label("CONTROL REFERENCE", "harmonicsTitle"), 0, 0, 1, 2)
         for row, (key, action) in enumerate(
             [
                 ("SPACE", "Play / pause"),
                 ("← / →", "Skip back / forward"),
                 ("F · F11", "Toggle fullscreen"),
                 ("ESC", "Exit fullscreen"),
-            ]
+            ],
+            start=1,
         ):
-            keys.addWidget(make_label(key, "keyCap"), row, 0, alignment=Qt.AlignmentFlag.AlignLeft)
-            keys.addWidget(QLabel(action), row, 1)
+            keys.addWidget(make_label(key, "keyCapGreen"), row, 0, alignment=Qt.AlignmentFlag.AlignLeft)
+            keys.addWidget(make_label(action, "keyAction"), row, 1)
         keys.setColumnStretch(1, 1)
-        keys.setRowStretch(4, 1)
 
-        outer.addWidget(config_box, stretch=3)
-        outer.addWidget(keys_box, stretch=1, alignment=Qt.AlignmentFlag.AlignTop)
-        return tab
+        outer.addWidget(config_box, stretch=3, alignment=Qt.AlignmentFlag.AlignTop)
+        outer.addStretch(1)
+        outer.addWidget(keys_box, alignment=Qt.AlignmentFlag.AlignTop)
+        return self.harmonics
 
     def _with_button(self, line_edit: QLineEdit, button: QPushButton) -> QWidget:
         box = QWidget()
@@ -879,6 +1040,8 @@ class MediaCenterWindow(QMainWindow):
             self.play_pause_button.setText("❚❚  PAUSE")
         else:
             self.play_pause_button.setText("▶  PLAY")
+            if state == QMediaPlayer.PlaybackState.PausedState:
+                self._remember_position(force_save=True)
         self._update_magi()
 
     def _on_volume_changed(self, value: int) -> None:
@@ -909,6 +1072,9 @@ class MediaCenterWindow(QMainWindow):
             lights["broadcast"].set_state(f"QUEUE {len(self.broadcast_queue)}", "busy")
         else:
             lights["broadcast"].set_state("STANDBY", "idle")
+
+        self.bc_graph.set_program(len(self.broadcast_queue), self.current_index if on_air else -1, on_air and playing)
+        self.bc_onair.set_active(on_air and playing)
 
         if playing:
             lights["player"].set_state("PLAYING", "ok")
@@ -1186,6 +1352,7 @@ class MediaCenterWindow(QMainWindow):
         self.tile_episodes.set_value(f"{len(shows):04d}")
         self.tile_movies.set_value(f"{len(self.media_items) - len(shows):03d}")
         self.tile_queue.set_value(f"{len(self.broadcast_queue):04d}")
+        self.sync_meters.set_readouts(self.sync_meters._last_session, len(self.media_items))
 
     def populate_library_tree(self) -> None:
         query = self.search_box.text().strip().lower()
@@ -1214,8 +1381,8 @@ class MediaCenterWindow(QMainWindow):
             status, clean_group_name = parse_collection_tag(group_name)
             count = len(grouped[group_name])
             parent = QTreeWidgetItem([clean_group_name, status_badge_text(status), f"{count} file{'s' if count != 1 else ''}"])
-            parent.setForeground(1, QBrush(QColor(theme.STATUS_COLORS.get(status, theme.TEXT_DIM))))
-            parent.setForeground(2, QBrush(QColor(theme.TEXT_DIM)))
+            parent.setForeground(1, QBrush(QColor(AMBER_STATUS_COLORS.get(status, "#6b4a1f"))))
+            parent.setForeground(2, QBrush(QColor("#6b4a1f")))
             title_font = parent.font(0)
             title_font.setBold(True)
             parent.setFont(0, title_font)
@@ -1223,8 +1390,8 @@ class MediaCenterWindow(QMainWindow):
             self.library_tree.addTopLevelItem(parent)
             for media in sorted(grouped[group_name], key=lambda m: self._natural_text_key(m.title)):
                 child = QTreeWidgetItem([media.title, media.kind.upper(), str(media.path)])
-                child.setForeground(1, QBrush(QColor(theme.ORANGE_DIM)))
-                child.setForeground(2, QBrush(QColor(theme.TEXT_DIM)))
+                child.setForeground(1, QBrush(QColor("#7a4200")))
+                child.setForeground(2, QBrush(QColor("#6b4a1f")))
                 icon = self._icon_for_media_item(media)
                 child.setIcon(0, icon)
                 child.setData(0, Qt.UserRole, str(media.path))
@@ -1235,6 +1402,10 @@ class MediaCenterWindow(QMainWindow):
             parent.setExpanded(False)
 
         self._focus_current_library_item()
+
+    def _collapse_all_series(self) -> None:
+        self.library_tree.collapseAll()
+        self.library_tree.scrollToTop()
 
     def _find_media_by_path(self, path_str: str) -> MediaItem | None:
         for item in self.media_items:
@@ -1314,27 +1485,44 @@ class MediaCenterWindow(QMainWindow):
         queue, start_index = self._series_queue_for_media(media)
         self.play_paths(queue, start_index=start_index, loop=False)
 
-    def _play_recent_item(self, item: QListWidgetItem) -> None:
-        path_str = item.data(Qt.UserRole)
+    def _play_recent_path(self, path_str: str) -> None:
         if not path_str:
             return
         path = Path(path_str)
         if not path.exists():
             QMessageBox.warning(self, "Missing File", f"File not found:\n{path}")
             return
+        row = next((r for r in self.state.data.get("recent", []) if r.get("path") == path_str), {})
+        position = int(row.get("position_ms", 0))
+        duration = int(row.get("duration_ms", 0))
+        finished = duration > 0 and position >= duration - RESUME_FINISHED_MARGIN_MS
+
         # Resume within the whole series so autoplay carries on to the next episode.
         media = self.media_lookup.get(str(path))
         if media:
             queue, start_index = self._series_queue_for_media(media)
-            self.play_paths(queue, start_index=start_index, loop=False)
         else:
-            self.play_paths([path], start_index=0, loop=False)
+            queue, start_index = [path], 0
+        if finished:
+            position = 0
+            if start_index + 1 < len(queue):
+                start_index += 1
+
+        resume_at = max(0, position - RESUME_REWIND_MS)
+        self.pending_restore_position_ms = resume_at or None
+        self.play_paths(queue, start_index=start_index, loop=False)
+        target = self.current_queue[self.current_index] if self.current_queue else path
+        if resume_at:
+            self._notify(f"RESUMING {target.stem} AT {self._fmt_time(resume_at)}")
+        elif finished:
+            self._notify(f"PREVIOUS EPISODE COMPLETE  //  STARTING {target.stem}")
 
     def _play_last_recent(self) -> None:
-        if self.recent_list.count() == 0:
+        recent = self.state.data.get("recent", [])
+        if not recent:
             self._notify("NO RECENT ACTIVITY TO RESUME")
             return
-        self._play_recent_item(self.recent_list.item(0))
+        self._play_recent_path(recent[0].get("path", ""))
 
     def play_paths(
         self,
@@ -1361,6 +1549,9 @@ class MediaCenterWindow(QMainWindow):
             return
 
         current_path = self.current_queue[self.current_index]
+        # Record where the outgoing file stopped before its source is replaced.
+        self._remember_position(force_save=True)
+        self.tracked_path = current_path
         self.player.setSource(QUrl.fromLocalFile(str(current_path)))
         self.monitor_stack.setCurrentWidget(self.video_widget)
         self._update_now_playing()
@@ -1405,9 +1596,12 @@ class MediaCenterWindow(QMainWindow):
             media = self._media_item_for_path(path)
             if media:
                 item.setIcon(self._icon_for_media_item(media))
+                if media.kind == "Movie":
+                    item.setForeground(QBrush(QColor("#e0287a")))
             item.setData(Qt.UserRole, str(path))
             self.bc_queue_list.addItem(item)
         self._update_broadcast_queue_highlight()
+        self._update_magi()
 
     def _update_broadcast_queue_highlight(self) -> None:
         if not self.broadcast_queue:
@@ -1536,9 +1730,30 @@ class MediaCenterWindow(QMainWindow):
             if not self.is_seeking:
                 self.progress.setValue(int(ms * 1000 / duration))
             self.position_label.setText(f"{self._fmt_time(ms)} / {self._fmt_time(duration)}")
+            self._remember_position()
         else:
             self.progress.setValue(0)
             self.position_label.setText("00:00 / 00:00")
+
+    def _remember_position(self, force_save: bool = False) -> None:
+        """Store the tracked file's position in its recent entry; writes to disk are throttled."""
+        if self.tracked_path is None or self.pending_restore_position_ms is not None:
+            return  # Nothing tracked, or a resume seek hasn't landed yet (position still reads 0).
+        duration = self.player.duration()
+        if duration <= 0:
+            return
+        row = next((r for r in self.state.data.get("recent", []) if r.get("path") == str(self.tracked_path)), None)
+        if row is None:
+            return
+        row["position_ms"] = int(self.player.position())
+        row["duration_ms"] = int(duration)
+
+        now = time.monotonic()
+        if force_save or now - self.last_position_save >= RESUME_SAVE_INTERVAL_S:
+            self.last_position_save = now
+            self.state.save()
+            if force_save:
+                self.refresh_recent_view()
 
     def _on_duration_changed(self, _ms: int) -> None:
         self._on_position_changed(self.player.position())
@@ -1655,31 +1870,64 @@ class MediaCenterWindow(QMainWindow):
         now = datetime.now().isoformat(timespec="seconds")
         recent = self.state.data.setdefault("recent", [])
 
+        previous = next((row for row in recent if row.get("path") == str(path)), {})
         recent = [row for row in recent if row.get("path") != str(path)]
-        recent.insert(0, {"path": str(path), "last_played": now})
+        entry = {"path": str(path), "last_played": now}
+        for key in ("position_ms", "duration_ms"):
+            if key in previous:
+                entry[key] = previous[key]
+        recent.insert(0, entry)
         self.state.data["recent"] = recent[:50]
         self.state.save()
         self.refresh_recent_view()
 
+    def _episode_label(self, path: Path) -> str:
+        match = EPISODE_NUMBER_PATTERN.search(path.stem)
+        return f"EP {match.group(1)}" if match else "FILE"
+
     def refresh_recent_view(self) -> None:
-        self.recent_list.clear()
-        for row in self.state.data.get("recent", []):
-            path = row.get("path", "")
-            played = friendly_timestamp(row.get("last_played", ""))
-            media = self._media_item_for_path(Path(path))
-            if media:
-                group = parse_collection_tag(media.group)[1].upper()
-                subtitle = f"{group}  //  {media.kind.upper()}  //  {played}"
+        recent = self.state.data.get("recent", [])
+        rows = []
+        for index, row in enumerate(recent):
+            path = Path(row.get("path", ""))
+            position, duration = int(row.get("position_ms", 0)), int(row.get("duration_ms", 0))
+            finished = duration > 0 and position >= duration - RESUME_FINISHED_MARGIN_MS
+            media = self._media_item_for_path(path)
+            group = parse_collection_tag(media.group)[1].upper() if media else path.parent.name.upper()
+            if not path.exists():
+                state = "MISSING"
+            elif finished:
+                state = "WATCHED"
             else:
-                subtitle = played
-            item = QListWidgetItem(f"{Path(path).stem}\n{subtitle}")
-            if media:
-                item.setIcon(self._icon_for_media_item(media))
-            if not Path(path).exists():
-                item.setForeground(QBrush(QColor(theme.DISABLED)))
-                item.setToolTip("File no longer exists")
-            item.setData(Qt.UserRole, path)
-            self.recent_list.addItem(item)
+                state = "RESUME ▸" if position > 0 else "START ▸"
+            rows.append(
+                {
+                    "path": str(path),
+                    "code": f"{index:02d}",
+                    "show": f"{group}  //  {friendly_timestamp(row.get('last_played', ''))}",
+                    "ep": self._episode_label(path),
+                    "time": f"{self._fmt_time(position)} / {self._fmt_time(duration)}" if duration else "--:-- / --:--",
+                    "state": state,
+                    "frac": 1.0 if finished else (position / duration if duration else 0.0),
+                }
+            )
+        self.sync_meters.set_rows(rows)
+        self.sync_meters.set_readouts(
+            friendly_timestamp(recent[0].get("last_played", "")) if recent else "—", len(self.media_items)
+        )
+
+        if not recent:
+            self.resume_hint.setText("NO RECENT ACTIVITY")
+            return
+        first = rows[0]
+        group = first["show"].split("  //  ")[0]
+        if first["state"] == "WATCHED":
+            self.resume_hint.setText(f"{group} · {first['ep']} COMPLETE  //  STARTS NEXT")
+        else:
+            position = int(recent[0].get("position_ms", 0))
+            self.resume_hint.setText(
+                f"RESUMES {group} · {first['ep']} AT {self._fmt_time(max(0, position - RESUME_REWIND_MS))}"
+            )
 
     def refresh_broadcast_lists(self) -> None:
         self.bc_show_list.clear()
@@ -1841,6 +2089,7 @@ class MediaCenterWindow(QMainWindow):
             return
 
         self.yt_run_btn.setEnabled(False)
+        self._set_task_state("yt", "ACTIVE")
         self._log("Starting download...")
 
         def job() -> None:
@@ -1850,6 +2099,7 @@ class MediaCenterWindow(QMainWindow):
 
         def done(message: str, ok: bool) -> None:
             self.yt_run_btn.setEnabled(True)
+            self._set_task_state("yt", "COMPLETE" if ok else "FAILED")
             if ok:
                 self._log("YouTube download completed.")
             else:
@@ -1873,6 +2123,7 @@ class MediaCenterWindow(QMainWindow):
             return
 
         self.ts_run_btn.setEnabled(False)
+        self._set_task_state("split", "ACTIVE")
         self._log("Starting timestamp split...")
 
         def job() -> None:
@@ -1886,6 +2137,7 @@ class MediaCenterWindow(QMainWindow):
 
         def done(message: str, ok: bool) -> None:
             self.ts_run_btn.setEnabled(True)
+            self._set_task_state("split", "COMPLETE" if ok else "FAILED")
             if ok:
                 self._log("Timestamp split completed.")
             else:
@@ -1903,9 +2155,11 @@ class MediaCenterWindow(QMainWindow):
 
         self.refresh_library()
         self.refresh_broadcast_lists()
+        self.harmonics.set_saved(True)
         self._notify("CONFIGURATION SAVED")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._remember_position()
         self._persist_broadcast_resume_state()
         super().closeEvent(event)
 
